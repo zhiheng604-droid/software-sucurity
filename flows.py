@@ -17,8 +17,8 @@ def flow_key(packet):
 @dataclass
 class Flow:
     key: tuple
-    earliest: float
-    latest: float
+    earliest: int
+    latest: int
     counts: list = field(default_factory=lambda: [0, 0])
     bytes: list = field(default_factory=lambda: [0, 0])
     syn: bool = False
@@ -29,8 +29,8 @@ class Flow:
     def observe(self, packet):
         segment = packet.tcp
         direction = int((packet.source, segment.source_port) != self.key[0])
-        self.earliest = min(self.earliest, packet.timestamp)
-        self.latest = max(self.latest, packet.timestamp)
+        self.earliest = min(self.earliest, packet.timestamp_us)
+        self.latest = max(self.latest, packet.timestamp_us)
         self.counts[direction] += 1
         self.bytes[direction] += segment.payload_length
         self.syn |= segment.flags & 0x12 == 0x02
@@ -61,7 +61,7 @@ def summarize_flows(packets):
         if key is None:
             continue
         if key not in flows:
-            flows[key] = Flow(key, packet.timestamp, packet.timestamp)
+            flows[key] = Flow(key, packet.timestamp_us, packet.timestamp_us)
         flows[key].observe(packet)
     return sorted(flows.values(), key=lambda flow: flow.latest, reverse=True)
 

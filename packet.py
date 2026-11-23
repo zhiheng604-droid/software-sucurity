@@ -34,7 +34,7 @@ class TcpSegment:
 @dataclass
 class Packet:
     number: int
-    timestamp: float
+    timestamp_us: int
     captured_length: int
     wire_length: int
     source: str
@@ -61,12 +61,13 @@ def _ip_text(raw: bytes) -> str:
         return "?"
 
 
-def _parse_packet(raw: bytes, linktype: int, number: int, timestamp: float,
+def _parse_packet(raw: bytes, linktype: int, number: int, timestamp_us: int,
                   wire_length: int) -> Packet:
+    seconds, micros = divmod(timestamp_us, 1_000_000)
     detail: List[Tuple[str, str]] = [
         ("Capture", f"Frame {number}"),
-        ("Timestamp", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
-         + f".{int((timestamp % 1) * 1_000_000):06d}"),
+        ("Timestamp", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(seconds))
+         + f".{micros:06d}"),
         ("Captured length", f"{len(raw)} bytes"),
         ("Wire length", f"{wire_length} bytes"),
         ("Link type", str(linktype)),
@@ -80,7 +81,7 @@ def _parse_packet(raw: bytes, linktype: int, number: int, timestamp: float,
 
     if linktype == DLT_EN10MB:
         if len(raw) < 14:
-            return Packet(number, timestamp, len(raw), wire_length, src, dst,
+            return Packet(number, timestamp_us, len(raw), wire_length, src, dst,
                           "Other", "Truncated Ethernet header", detail, raw)
         dst_mac = ":".join(f"{b:02x}" for b in raw[0:6])
         src_mac = ":".join(f"{b:02x}" for b in raw[6:12])
@@ -97,7 +98,7 @@ def _parse_packet(raw: bytes, linktype: int, number: int, timestamp: float,
             vlan_count += 1
     elif linktype in (DLT_NULL, DLT_LOOP):
         if len(raw) < 4:
-            return Packet(number, timestamp, len(raw), wire_length, src, dst,
+            return Packet(number, timestamp_us, len(raw), wire_length, src, dst,
                           "Other", "Truncated loopback header", detail, raw)
         family = int.from_bytes(raw[:4], 'big' if linktype == DLT_LOOP else 'little')
         if linktype == DLT_NULL and family > 65535:
@@ -110,7 +111,7 @@ def _parse_packet(raw: bytes, linktype: int, number: int, timestamp: float,
     elif linktype in (DLT_LINUX_SLL, DLT_LINUX_SLL2):
         offset = 16 if linktype == DLT_LINUX_SLL else 20
         if len(raw) < offset:
-            return Packet(number, timestamp, len(raw), wire_length, src, dst,
+            return Packet(number, timestamp_us, len(raw), wire_length, src, dst,
                           "Other", "Truncated Linux cooked header", detail, raw)
         ethertype = _u16(raw, 14 if offset == 16 else 0)
         detail.extend([("Linux cooked", ""), ("  Protocol", f"0x{ethertype:04x}")])
@@ -126,12 +127,12 @@ def _parse_packet(raw: bytes, linktype: int, number: int, timestamp: float,
 
     if ethertype == 0x0800:
         if len(raw) < offset + 20:
-            return Packet(number, timestamp, len(raw), wire_length, src, dst,
+            return Packet(number, timestamp_us, len(raw), wire_length, src, dst,
                           "IPv4", "Truncated IPv4 header", detail, raw)
         first = raw[offset]
         ihl = (first & 0x0f) * 4
         if first >> 4 != 4 or ihl < 20 or len(raw) < offset + ihl:
-            return Packet(number, timestamp, len(raw), wire_length, src, dst,
+            return Packet(number, timestamp_us, len(raw), wire_length, src, dst,
                           "IPv4", "Invalid IPv4 header length", detail, raw)
         total_len = _u16(raw, offset + 2)
         ident = _u16(raw, offset + 4)
@@ -159,7 +160,7 @@ def _parse_packet(raw: bytes, linktype: int, number: int, timestamp: float,
             protocol, info, tcp = _parse_transport(raw[:ip_end], transport, proto_num, 4, detail)
     elif ethertype == 0x86DD:
         if len(raw) < offset + 40 or raw[offset] >> 4 != 6:
-            return Packet(number, timestamp, len(raw), wire_length, src, dst,
+            return Packet(number, timestamp_us, len(raw), wire_length, src, dst,
                           "IPv6", "Truncated or invalid IPv6 header", detail, raw)
         payload_len = _u16(raw, offset + 4)
         next_header = raw[offset + 6]
@@ -223,7 +224,7 @@ def _parse_packet(raw: bytes, linktype: int, number: int, timestamp: float,
     else:
         info = "Ethernet type not decoded" if ethertype is not None else "No supported network layer found"
 
-    return Packet(number, timestamp, len(raw), wire_length, src, dst, protocol, info, detail, raw, tcp)
+    return Packet(number, timestamp_us, len(raw), wire_length, src, dst, protocol, info, detail, raw, tcp)
 
 
 def _parse_transport(raw, pos, proto_num, version, detail):
@@ -249,7 +250,7 @@ def _parse_transport(raw, pos, proto_num, version, detail):
         payload = raw[pos + header_len:]
         summary = f"{sport} → {dport}"
         if flags & 0x02:
-            summary += " [SYN]"
+            summary += " [SYN, ACK]" if flags & 0x10 else " [SYN]"
         if flags & 0x01:
             summary += " [FIN]"
         if flags & 0x04:

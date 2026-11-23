@@ -189,7 +189,7 @@ def run_capture(pcap, request, stop, on_ready, on_packet, result):
             if record.captured > 262144 or record.captured > record.wire:
                 raise ValueError('捕获记录长度无效或超过 256 KiB')
             raw = C.string_at(data, record.captured)
-            stamp = record.time.seconds + record.time.microseconds / 1_000_000
+            stamp = record.time.seconds * 1_000_000 + record.time.microseconds
             packet = _parse_packet(raw, linktype, result.received, stamp, record.wire)
             if not on_packet(packet):
                 result.queue_dropped += 1

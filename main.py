@@ -63,7 +63,14 @@ class SnifferApp:
             style.theme_use("clam")
         except tk.TclError:
             pass
+        style.configure("TFrame", background="#f3f5f7")
+        style.configure("TLabel", background="#f3f5f7", foreground="#1b303d")
+        style.configure("TButton", padding=(9, 6), background="#e8eff4",
+                        foreground="#1b303d", bordercolor="#c0ced9")
+        style.map("TButton", background=[("disabled", "#f3f5f7"), ("active", "#d6e9f6")])
         style.configure("Treeview", rowheight=24, font=("Arial", 10))
+        style.map("Treeview", background=[("selected", "#385d76")])
+        style.configure("Treeview.Heading", background="#e8eff4", foreground="#1b303d")
         style.configure("Treeview.Heading", font=("Arial", 10, "bold"))
 
         toolbar = ttk.Frame(self.root, padding=(12, 10))
@@ -307,8 +314,8 @@ class SnifferApp:
             self._insert_packet(packet)
 
     def _insert_packet(self, packet):
-        stamp = time.strftime('%H:%M:%S', time.localtime(packet.timestamp))
-        stamp += f'.{int((packet.timestamp % 1) * 1000):03d}'
+        seconds, micros = divmod(packet.timestamp_us, 1_000_000)
+        stamp = time.strftime('%H:%M:%S', time.localtime(seconds)) + f'.{micros // 1000:03d}'
         length = (packet.captured_length if packet.captured_length == packet.wire_length
                   else f'{packet.captured_length}/{packet.wire_length}')
         self.packet_tree.insert('', 'end', iid=str(packet.number), tags=(packet.protocol,), values=(
@@ -392,24 +399,34 @@ class SnifferApp:
         for key, title, width in zip(columns, headings, widths):
             table.heading(key, text=title)
             table.column(key, width=width, minwidth=54)
-        table.pack(fill='both', expand=True)
+        table_scroll = ttk.Scrollbar(frame, orient='vertical', command=table.yview)
+        table.configure(yscrollcommand=table_scroll.set)
         actions = ttk.Frame(frame, padding=(0, 8, 0, 0))
-        actions.pack(fill='x')
+        actions.pack(fill='x', side='bottom')
+        table_scroll.pack(side='right', fill='y')
+        table.pack(fill='both', expand=True)
         note = tk.StringVar(value='统计范围为当前保留的 TCP 包。双击可跟踪。')
         keys = {}
         outcome = queue.SimpleQueue()
+        process_name = tk.StringVar(value='全部进程')
+        process_picker = ttk.Combobox(actions, textvariable=process_name, width=16,
+                                      values=['全部进程'], state='readonly')
+
 
         def refresh():
             table.delete(*table.get_children())
             keys.clear()
             for i, flow in enumerate(summarize_flows(self.packets.values())):
+                processes = self.processes.get(flow.key, ())
+                if process_picker.current() != 0 and process_name.get() not in processes:
+                    continue
                 a, b = flow.key
                 iid = str(i)
                 keys[iid] = flow.key
                 table.insert('', 'end', iid=iid, values=(
                     endpoint(a), endpoint(b), ' / '.join(map(str, flow.counts)),
-                    ' / '.join(map(str, flow.bytes)), f'{flow.latest - flow.earliest:.3f}',
-                    flow.state, ', '.join(sorted(self.processes.get(flow.key, ())))))
+                    ' / '.join(map(str, flow.bytes)), f'{(flow.latest - flow.earliest) / 1_000_000:.3f}',
+                    flow.state, ', '.join(sorted(processes))))
         def follow(_event=None):
             selected = table.selection()
             if selected:
@@ -425,6 +442,9 @@ class SnifferApp:
                 window.after(60, receive_snapshot)
                 return
             self.processes, reason = outcome.get()
+            names = sorted({process for items in self.processes.values() for process in items})
+            process_picker.configure(values=['全部进程', *names])
+            process_picker.current(0)
             note.set(reason or '进程快照已更新，仅匹配仍存在且当前账号可见的连接。')
             snapshot_button.configure(state='normal')
             refresh()
@@ -432,6 +452,8 @@ class SnifferApp:
         ttk.Button(actions, text='跟踪此流', command=follow).pack(side='left', padx=(0, 6))
         snapshot_button = ttk.Button(actions, text='读取本机进程', command=snapshot)
         snapshot_button.pack(side='left', padx=(0, 8))
+        process_picker.pack(side='left', padx=(0, 8))
+        process_picker.bind('<<ComboboxSelected>>', lambda _event: refresh())
         if self.offline:
             snapshot_button.configure(state='disabled')
         ttk.Label(actions, textvariable=note).pack(side='left')
