@@ -22,7 +22,7 @@ python3 main.py --list
 
 BPF 在每次打开采集来源时编译和安装，例如 `tcp port 18765`。显示协议只隐藏当前保留的行。TCP 过滤包含标记为 HTTP 的 TCP 段。双击「TCP 流」窗口中的某行可跟踪该流，或在主界面使用「跟踪所选包」。
 
-TCP 流统计基于当前保留窗口。载荷字节含重传，不表示应用层实际交付量。同一端点对在窗口内重复使用时会合并统计。macOS/Linux 的进程按钮通过 `lsof` 查当前可见的本机套接字，短连接、已关闭连接和当前账号不可见的连接可能无法匹配。Windows 进程匹配待移植。
+TCP 流统计基于当前保留窗口。载荷字节含重传，不表示应用层实际交付量。相同端点再次出现不同初始序号的 SYN 时会分开编号。没看到新 SYN 时仍可能无法区分。macOS/Linux 的进程按钮通过 `lsof` 查当前可见的本机套接字，当前快照只绑定到同端点对最新且未观察到关闭的连接。Windows 进程匹配待移植。
 
 ## 文件
 
@@ -39,6 +39,8 @@ TCP 流统计基于当前保留窗口。载荷字节含重传，不表示应用�
 
 - `python3 verify_offline.py` 检查两个样本、导出往返和不完整文件的启动行为。用「打开 PCAP…」载入 `netlens_http_split.pcap`，选 HTTP 后点击第 6 帧。协议详情里点击「帧 #4」会打开对应的十六进制页，再点「回到重组帧」可回第 6 帧。来源帧被缓存淘汰时会显示不可查看。
 - `python3 demo_traffic.py split-fixture` 重建跨段样本。
+- 用「打开 PCAP…」载入 `netlens_tcp_reuse.pcap`，打开「TCP 流…」可查看端点相同的连接 #1 和 #5。用 `python3 demo_traffic.py reuse-fixture` 重建该样本。
 - `sudo /usr/bin/python3 -B verify_extended.py all --duration 2 --trials 3` 在 macOS 回环上验证跨段请求与响应、两客户端 PID 筛选，并完成 12 轮 UDP 性能对照。该脚本只使用回环接口和本机临时端口。可加 `--output result.json` 保存原始记录。
+- `python3 -B verify_gui_perf.py --replay --duration 2 --trials 3` 用定速 PCAP 回放测实际 Tk 列表。去掉 `--replay` 后使用本机回环实时抓包，需有抓包权限。脚本记录队列丢弃、保留数和界面回调延迟。
 
 HTTP/1.x 首行重组按方向最多跟踪 512 字节，识别成功时列出来源帧。支持已看到 SYN 时的乱序、重传和序号回绕。连接中途开始采集时，只能从能识别的首行前缀开始。保留现有单段检测用于后续请求。当前版本不做完整 TCP 字节流或 HTTP 消息体重组、TLS 解密和多接口同时采集。Windows Npcap 和 Linux 实机尚未验证。

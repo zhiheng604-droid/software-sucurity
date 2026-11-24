@@ -1,5 +1,6 @@
 """Group both directions of a TCP conversation in the retained capture window."""
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import ipaddress
 import shutil
@@ -14,11 +15,42 @@ def flow_key(packet):
     return tuple(sorted((source, target)))
 
 
+def flow_identity(packet):
+    endpoints = flow_key(packet)
+    return (endpoints, packet.connection_id) if endpoints is not None else None
+
+
+class ConnectionTracker:
+    """Keep a bounded map from endpoint pair to its most recently observed connection."""
+
+    def __init__(self, capacity=4096):
+        self.capacity = capacity
+        self.current = OrderedDict()
+
+    def observe(self, packet):
+        endpoints = flow_key(packet)
+        segment = packet.tcp
+        signature = None
+        if segment.flags & 0x12 == 0x02:  # SYN without ACK
+            signature = (packet.source, segment.source_port, segment.sequence)
+        record = self.current.get(endpoints)
+        if record is None or (signature is not None and signature != record[1]):
+            record = (packet.number, signature)
+            self.current[endpoints] = record
+        self.current.move_to_end(endpoints)
+        if len(self.current) > self.capacity:
+            self.current.popitem(last=False)
+        packet.connection_id, opener = record
+        packet.connection_has_syn = opener is not None
+
+
 @dataclass
 class Flow:
     key: tuple
     earliest: int
     latest: int
+    connection_id: int = 0
+    start_observed: bool = False
     counts: list = field(default_factory=lambda: [0, 0])
     bytes: list = field(default_factory=lambda: [0, 0])
     syn: bool = False
@@ -35,9 +67,18 @@ class Flow:
         self.bytes[direction] += segment.payload_length
         self.syn |= segment.flags & 0x12 == 0x02
         self.syn_ack |= segment.flags & 0x12 == 0x12
+        self.start_observed |= packet.connection_has_syn
         self.reset |= bool(segment.flags & 0x04)
         if segment.flags & 1:
             self.fin.add(direction)
+
+    @property
+    def identity(self):
+        return self.key, self.connection_id
+
+    @property
+    def closed(self):
+        return self.reset or len(self.fin) == 2
 
     @property
     def state(self):
@@ -51,18 +92,22 @@ class Flow:
             return '观察到 SYN / SYN-ACK'
         if self.syn:
             return '观察到 SYN'
+        if self.start_observed:
+            return '起始帧已不在保留窗内'
         return '未观察到连接起始'
 
 
 def summarize_flows(packets):
     flows = {}
     for packet in packets:
-        key = flow_key(packet)
-        if key is None:
+        identity = flow_identity(packet)
+        if identity is None:
             continue
-        if key not in flows:
-            flows[key] = Flow(key, packet.timestamp_us, packet.timestamp_us)
-        flows[key].observe(packet)
+        if identity not in flows:
+            endpoints, connection_id = identity
+            flows[identity] = Flow(endpoints, packet.timestamp_us, packet.timestamp_us,
+                                   connection_id)
+        flows[identity].observe(packet)
     return sorted(flows.values(), key=lambda flow: flow.latest, reverse=True)
 
 
@@ -76,15 +121,26 @@ class SocketOwner:
         return f'{self.command} ({self.pid})'
 
 
-def flows_for_process(flows, sockets, pid=None):
+def bind_processes(flows, sockets):
+    """Bind a current socket snapshot to the latest observed connection only."""
+    latest = {}
+    for flow in flows:
+        previous = latest.get(flow.key)
+        if previous is None or flow.connection_id > previous.connection_id:
+            latest[flow.key] = flow
+    return {flow.identity: sockets[flow.key] for flow in latest.values()
+            if not flow.closed and flow.key in sockets}
+
+
+def flows_for_process(flows, owners, pid=None):
     """Apply the same PID filter in the flow window and in verification."""
     return [flow for flow in flows
-            if pid is None or any(owner.pid == pid for owner in sockets.get(flow.key, ()))]
+            if pid is None or any(owner.pid == pid for owner in owners.get(flow.identity, ()))]
 
 
-def flow_process_options(flows, sockets):
-    owners = {owner for flow in flows for owner in sockets.get(flow.key, ())}
-    return {owner.label: owner.pid for owner in sorted(owners)}
+def flow_process_options(flows, owners):
+    visible = {owner for flow in flows for owner in owners.get(flow.identity, ())}
+    return {owner.label: owner.pid for owner in sorted(visible)}
 
 
 def _endpoint(value):

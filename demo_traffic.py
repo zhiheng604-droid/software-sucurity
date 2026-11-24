@@ -92,7 +92,8 @@ def write_fixture(path, frames, truncate_last=False):
         file.write(struct.pack('<IHHIIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
         for index, frame in enumerate(frames):
             captured = frame[:32] if truncate_last and index == len(frames) - 1 else frame
-            file.write(struct.pack('<IIII', STAMP, 1000 + index * 20000, len(captured), len(frame)))
+            seconds, micros = divmod(1000 + index * 20000, 1_000_000)
+            file.write(struct.pack('<IIII', STAMP + seconds, micros, len(captured), len(frame)))
             file.write(captured)
 
 
@@ -124,6 +125,25 @@ def make_split_fixture(path, omit_middle=False):
         source, target = (b, a) if reverse else (a, b)
         sport, dport = (PORT, 50000) if reverse else (50000, PORT)
         segment = tcp(source, target, sport, dport, seq & 0xffffffff, ack, flags, payload)
+        frames.append(ethernet(ip4(segment, 6, source, target), 0x0800))
+    write_fixture(path, frames)
+
+
+def make_reuse_fixture(path):
+    """Two observed TCP handshakes reuse the same endpoints. The first SYN is retried."""
+    a = ip_address('192.0.2.10').packed
+    b = ip_address('198.51.100.20').packed
+    observations = [
+        (False, 100, 0, 0x02), (False, 100, 0, 0x02),
+        (True, 200, 101, 0x12), (False, 101, 201, 0x10),
+        (False, 800, 0, 0x02), (True, 950, 801, 0x12),
+        (False, 801, 951, 0x10),
+    ]
+    frames = []
+    for reverse, seq, ack, flags in observations:
+        source, target = (b, a) if reverse else (a, b)
+        sport, dport = (PORT, 50000) if reverse else (50000, PORT)
+        segment = tcp(source, target, sport, dport, seq, ack, flags, b'')
         frames.append(ethernet(ip4(segment, 6, source, target), 0x0800))
     write_fixture(path, frames)
 
@@ -228,7 +248,8 @@ def verify_live(output):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['fixture', 'split-fixture', 'talk', 'live-check'])
+    parser.add_argument('mode', choices=['fixture', 'split-fixture', 'reuse-fixture',
+                                         'talk', 'live-check'])
     parser.add_argument('--output', help='Output path for the fixture or live-check JSON')
     parser.add_argument('--hold', type=int, default=0, metavar='SECONDS',
                         help='Keep the loopback HTTP connection open for the recording')
@@ -239,6 +260,8 @@ if __name__ == '__main__':
         make_fixture(Path(args.output) if args.output else HERE / 'netlens_demo.pcap')
     elif args.mode == 'split-fixture':
         make_split_fixture(Path(args.output) if args.output else HERE / 'netlens_http_split.pcap')
+    elif args.mode == 'reuse-fixture':
+        make_reuse_fixture(Path(args.output) if args.output else HERE / 'netlens_tcp_reuse.pcap')
     elif args.mode == 'talk':
         print('HTTP and UDP loopback complete. Local process match:', generate(args.hold))
     else:

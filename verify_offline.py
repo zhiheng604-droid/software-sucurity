@@ -8,10 +8,11 @@ import unittest
 
 from capture import CaptureRequest, CaptureResult, Pcap, run_capture, write_pcap
 from demo_traffic import make_split_fixture
-from flows import summarize_flows
+from flows import SocketOwner, bind_processes, flows_for_process, summarize_flows
 
 SAMPLE = Path(__file__).resolve().with_name('netlens_demo.pcap')
 SPLIT_SAMPLE = SAMPLE.with_name('netlens_http_split.pcap')
+REUSE_SAMPLE = SAMPLE.with_name('netlens_tcp_reuse.pcap')
 
 
 class OfflineCaptureTests(unittest.TestCase):
@@ -124,6 +125,18 @@ class OfflineCaptureTests(unittest.TestCase):
                         lambda _: self.fail('unexpected packet'), result)
         self.assertTrue(result.error)
         self.assertFalse(ready)
+
+    def test_reused_endpoints_keep_connections_and_pid_separate(self):
+        result, packets = self.read(path=REUSE_SAMPLE)
+        self.assertTrue(result.ended, result.error)
+        self.assertEqual([packet.connection_id for packet in packets], [1, 1, 1, 1, 5, 5, 5])
+        newer, older = summarize_flows(packets)
+        self.assertEqual(newer.key, older.key)
+        self.assertEqual([newer.counts, older.counts], [[2, 1], [3, 1]])
+        snapshot = {newer.key: {SocketOwner(1234, 'example')}}
+        owners = bind_processes([newer, older], snapshot)
+        self.assertNotIn(older.identity, owners)
+        self.assertEqual(flows_for_process([newer, older], owners, 1234), [newer])
 
 
 if __name__ == '__main__':

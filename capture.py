@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 from tempfile import mkstemp
 
+from flows import ConnectionTracker
 from http_stream import HttpInspector
 from packet import _parse_packet
 
@@ -222,6 +223,7 @@ def run_capture(pcap, request, stop, on_ready, on_packet, result):
             on_ready(linktype)
 
         http = HttpInspector()
+        connections = ConnectionTracker()
         header, data = C.POINTER(Header)(), C.c_void_p()
         while not stop.is_set():
             status = lib.pcap_next_ex(handle, C.byref(header), C.byref(data))
@@ -242,6 +244,8 @@ def run_capture(pcap, request, stop, on_ready, on_packet, result):
             raw = C.string_at(data, record.captured)
             stamp = record.time.seconds * 1_000_000 + record.time.microseconds
             packet = _parse_packet(raw, linktype, result.received, stamp, record.wire)
+            if packet.tcp is not None:
+                connections.observe(packet)
             http.observe(packet)
             if not ready:
                 on_ready(linktype)

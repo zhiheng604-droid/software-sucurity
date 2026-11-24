@@ -16,7 +16,8 @@ import threading
 import time
 
 from capture import CaptureRequest, CaptureResult, Pcap, run_capture
-from flows import find_local_processes, flow_process_options, flows_for_process, summarize_flows
+from flows import (bind_processes, find_local_processes, flow_process_options,
+                   flows_for_process, summarize_flows)
 
 LOOPBACK = '127.0.0.1'
 PAYLOAD_SIZE = 128
@@ -149,10 +150,11 @@ def http_and_processes(pcap, interface):
                     snapshot, reason = find_local_processes()
                     time.sleep(0.2)
                     flows = summarize_flows(packets)
-                    visible = flow_process_options(flows, snapshot)
+                    owners = bind_processes(flows, snapshot)
+                    visible = flow_process_options(flows, owners)
                     selected = []
                     for proc in clients:
-                        matching = flows_for_process(flows, snapshot, proc['pid'])
+                        matching = flows_for_process(flows, owners, proc['pid'])
                         ports = sorted(p for flow in matching for _a, p in flow.key if p != port)
                         selected.append({'pid': proc['pid'], 'expected_ports': sorted(proc['ports']),
                                          'actual_ports': ports, 'flow_count': len(matching)})

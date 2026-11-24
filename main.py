@@ -16,7 +16,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from capture import Pcap, CaptureRequest, CaptureResult, decode, run_capture, write_pcap
-from flows import (find_local_processes, flow_key, flow_process_options,
+from flows import (bind_processes, find_local_processes, flow_identity, flow_process_options,
                    flows_for_process, summarize_flows)
 
 FILTERS = {
@@ -30,6 +30,9 @@ FILTERS = {
     "ARP": lambda p: p.protocol == "ARP",
 }
 
+QUEUE_CAPACITY = 2048
+GUI_BATCH_LIMIT = 512
+GUI_BATCH_SECONDS = 0.006
 
 @dataclass
 class OpeningSource:
@@ -49,8 +52,10 @@ class SnifferApp:
         self.packets = OrderedDict()
         self.buffer_bytes = 0
         self.evicted = 0
-        self.incoming = queue.Queue(maxsize=256)
+        self.incoming = queue.Queue(maxsize=QUEUE_CAPACITY)
         self.control = queue.SimpleQueue()
+        self.worker_done = False
+        self.last_summary_at = 0.0
         self.stop_event = threading.Event()
         self.result = CaptureResult()
         self.opening = None
@@ -238,6 +243,8 @@ class SnifferApp:
         if self.running:
             return
         pending = self.opening = OpeningSource(request, label, CaptureResult())
+        self.worker_done = False
+        self.last_summary_at = 0.0
         self.stop_event.clear()
         self.set_running(True)
         self.status_var.set(f'正在打开 {label}…')
@@ -298,19 +305,21 @@ class SnifferApp:
             self.status_var.set('正在停止…')
 
     def _drain_packets(self):
-        done = False
         while not self.control.empty():
             status, value = self.control.get_nowait()
             if status == 'ready':
                 if self.opening is not None and not self.stop_event.is_set():
                     self._accept_source(value)
             elif status == 'done':
-                done = True
+                self.worker_done = True
         added = False
         # The worker may enqueue its first packet just after this tick checked
         # the control queue. Hold those packets until the ready event is read.
-        if self.opening is None or done:
-            for _ in range(self.incoming.maxsize):
+        if self.opening is None or self.worker_done:
+            deadline = time.perf_counter() + GUI_BATCH_SECONDS
+            for index in range(GUI_BATCH_LIMIT):
+                if index and index % 16 == 0 and time.perf_counter() >= deadline:
+                    break
                 try:
                     packet = self.incoming.get_nowait()
                 except queue.Empty:
@@ -318,7 +327,9 @@ class SnifferApp:
                 if self.opening is None:
                     self._append_packet(packet)
                     added = True
-        if done:
+        backlog = not self.incoming.empty()
+        if self.worker_done and not backlog:
+            self.worker_done = False
             pending = self.opening
             self.opening = None
             self.set_running(False)
@@ -336,8 +347,13 @@ class SnifferApp:
                 prefix = '离线读取完成' if self.result.ended and self.offline else '已停止'
                 self._set_summary(prefix)
         elif added and self.running and not self.stop_event.is_set():
-            self._set_summary('离线读取中' if self.offline else '实时抓包中')
-        self.root.after(60, self._drain_packets)
+            now = time.monotonic()
+            if now - self.last_summary_at >= 0.1:
+                self.last_summary_at = now
+                self._set_summary('离线读取中' if self.offline else '实时抓包中')
+        # Yield to Tk between slices. Do not wait a full timer interval while
+        # packets are already queued, or mark the capture finished before drain.
+        self.root.after(1 if backlog else 16, self._drain_packets)
 
     def _update_export_button(self):
         enabled = not self.running and self.linktype is not None and bool(self.packets)
@@ -373,7 +389,7 @@ class SnifferApp:
             return True
         predicate = FILTERS[self.filter_var.get()]
         return ((predicate is None or predicate(packet)) and
-                (self.stream is None or flow_key(packet) == self.stream))
+                (self.stream is None or flow_identity(packet) == self.stream))
 
     def _append_packet(self, packet):
         self.packets[packet.number] = packet
@@ -519,7 +535,7 @@ class SnifferApp:
 
     def follow_selected(self):
         packet = self._selected_packet()
-        key = flow_key(packet) if packet else None
+        key = flow_identity(packet) if packet else None
         if key is None:
             self.status_var.set('选中包含完整 TCP 头的包后可跟踪双向流。')
         else:
@@ -529,7 +545,9 @@ class SnifferApp:
         self.stream = key
         self._refresh_rows()
         if key is not None:
-            self.status_var.set(f'跟踪 TCP 流 · {endpoint(key[0])} ↔ {endpoint(key[1])} · {self.visible} 包')
+            pair, instance = key
+            self.status_var.set(f'跟踪 TCP 流 #{instance} · {endpoint(pair[0])} ↔ '
+                                f'{endpoint(pair[1])} · {self.visible} 包')
 
     def open_flows(self):
         window = tk.Toplevel(self.root)
@@ -544,10 +562,11 @@ class SnifferApp:
         window.geometry('1040x380')
         frame = ttk.Frame(window, padding=10)
         frame.pack(fill='both', expand=True)
-        columns = ('a', 'b', 'packets', 'bytes', 'duration', 'state', 'process')
+        columns = ('a', 'b', 'connection', 'packets', 'bytes', 'duration', 'state', 'process')
         table = ttk.Treeview(frame, columns=columns, show='headings', selectmode='browse')
-        headings = ('端点 A', '端点 B', '包 A→B / B→A', '载荷字节 A→B / B→A', '时长 s', '观察状态', '本机进程快照')
-        widths = (150, 150, 103, 137, 65, 142, 190)
+        headings = ('端点 A', '端点 B', '连接编号', '双向包数', '双向载荷字节',
+                    '时长 s', '观察状态', '本机进程快照')
+        widths = (145, 145, 73, 94, 128, 60, 148, 170)
         for key, title, width in zip(columns, headings, widths):
             table.heading(key, text=title)
             table.column(key, width=width, minwidth=54)
@@ -557,7 +576,7 @@ class SnifferApp:
         actions.pack(fill='x', side='bottom')
         table_scroll.pack(side='right', fill='y')
         table.pack(fill='both', expand=True)
-        note = tk.StringVar(value='统计范围为当前保留的 TCP 包。双击可跟踪。')
+        note = tk.StringVar(value='统计当前保留包，双向栏顺序为 A→B / B→A。')
         keys = {}
         outcome = queue.SimpleQueue()
         process_name = tk.StringVar(value='全部进程')
@@ -568,19 +587,21 @@ class SnifferApp:
             table.delete(*table.get_children())
             keys.clear()
             flows = summarize_flows(self.packets.values())
-            options = flow_process_options(flows, self.processes)
+            owners = {flow.identity: self.processes[flow.identity] for flow in flows
+                      if not flow.closed and flow.identity in self.processes}
+            options = flow_process_options(flows, owners)
             current = process_name.get()
             process_picker.configure(values=['全部进程', *options])
             if current not in options:
                 process_picker.current(0)
             selected_pid = options.get(process_name.get())
-            for i, flow in enumerate(flows_for_process(flows, self.processes, selected_pid)):
-                processes = self.processes.get(flow.key, ())
+            for i, flow in enumerate(flows_for_process(flows, owners, selected_pid)):
+                processes = owners.get(flow.identity, ())
                 a, b = flow.key
                 iid = str(i)
-                keys[iid] = flow.key
+                keys[iid] = flow.identity
                 table.insert('', 'end', iid=iid, values=(
-                    endpoint(a), endpoint(b), ' / '.join(map(str, flow.counts)),
+                    endpoint(a), endpoint(b), f'#{flow.connection_id}', ' / '.join(map(str, flow.counts)),
                     ' / '.join(map(str, flow.bytes)), f'{(flow.latest - flow.earliest) / 1_000_000:.3f}',
                     flow.state, ', '.join(owner.label for owner in sorted(processes))))
         def follow(_event=None):
@@ -591,15 +612,20 @@ class SnifferApp:
         def snapshot():
             snapshot_button.configure(state='disabled')
             note.set('正在读取本机套接字快照…')
+            flows_at_request = summarize_flows(self.packets.values())
             threading.Thread(target=lambda: outcome.put(find_local_processes()), daemon=True).start()
-            self.root.after(60, receive_snapshot)
-        def receive_snapshot():
+            self.root.after(60, lambda: receive_snapshot(flows_at_request))
+        def receive_snapshot(flows_at_request):
             if not window.winfo_exists():
                 return
             if outcome.empty():
-                self.root.after(60, receive_snapshot)
+                self.root.after(60, lambda: receive_snapshot(flows_at_request))
                 return
-            self.processes, reason = outcome.get()
+            sockets, reason = outcome.get()
+            before = bind_processes(flows_at_request, sockets)
+            now = bind_processes(summarize_flows(self.packets.values()), sockets)
+            self.processes = {identity: owners for identity, owners in now.items()
+                              if identity in before}
             note.set(reason or '进程快照已更新，仅匹配仍存在且当前账号可见的连接。')
             snapshot_button.configure(state='normal')
             refresh()

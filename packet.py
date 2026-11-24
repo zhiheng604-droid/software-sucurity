@@ -39,6 +39,8 @@ class Packet:
     raw: bytes
     tcp: Optional[TcpSegment] = None
     http_frames: Tuple[int, ...] = ()
+    connection_id: int = 0
+    connection_has_syn: bool = False
 
 
 def _u16(data: bytes, pos: int) -> int:
