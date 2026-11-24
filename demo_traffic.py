@@ -106,7 +106,7 @@ class DemoHandler(BaseHTTPRequestHandler):
         pass
 
 
-def generate():
+def generate(hold=0):
     """Produce ordinary HTTP and UDP requests, addressed solely to 127.0.0.1."""
     with HTTPServer(('127.0.0.1', PORT), DemoHandler) as server:
         worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -122,14 +122,17 @@ def generate():
                 from flows import find_local_processes
                 process_map, _ = find_local_processes()
                 matched = any(('127.0.0.1', PORT) in key for key in process_map)
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+                    receiver.bind(('127.0.0.1', 0))
+                    receiver.settimeout(2)
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                        sender.sendto(b'NetLens UDP demo', receiver.getsockname())
+                    receiver.recvfrom(1024)
+                if hold:
+                    print(f'HTTP 200、UDP 已发送。HTTP 连接保留 {hold} 秒，可回到 NetLens 查看进程。', flush=True)
+                    time.sleep(hold)
             finally:
                 conn.close()
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
-                receiver.bind(('127.0.0.1', 0))
-                receiver.settimeout(2)
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
-                    sender.sendto(b'NetLens UDP demo', receiver.getsockname())
-                receiver.recvfrom(1024)
         finally:
             server.shutdown()
             worker.join()
@@ -191,10 +194,14 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=['fixture', 'talk', 'live-check'])
     parser.add_argument('--output', help='Output path for the fixture or live-check JSON')
+    parser.add_argument('--hold', type=int, default=0, metavar='SECONDS',
+                        help='Keep the loopback HTTP connection open for the recording')
     args = parser.parse_args()
+    if not 0 <= args.hold <= 120 or (args.hold and args.mode != 'talk'):
+        parser.error('--hold takes 0–120 seconds and applies only to talk')
     if args.mode == 'fixture':
         make_fixture(Path(args.output) if args.output else HERE / 'netlens_demo.pcap')
     elif args.mode == 'talk':
-        print('HTTP and UDP loopback complete. Local process match:', generate())
+        print('HTTP and UDP loopback complete. Local process match:', generate(args.hold))
     else:
         raise SystemExit(verify_live(args.output))

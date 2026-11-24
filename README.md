@@ -12,6 +12,7 @@ python3 main.py --list
 - **离线查看**：点击「加载课程样本」或「打开 PCAP」。样本使用文档示例地址，无需抓包权限。
 - **实时抓包**：选择接口，填写可选的 BPF 表达式后点击「开始抓包」。macOS 需要有权限打开 `/dev/bpf*`，Linux 需要平台配置的抓包权限。Windows 安装 Npcap 后用 `py main.py` 启动。
 - **安全复现**：macOS 选 `lo0`，填 `(tcp port 18765) or (udp and host 127.0.0.1)` 并开始抓包。另开终端运行 `python3 demo_traffic.py talk`。它只在 `127.0.0.1` 上产生 HTTP 和 UDP 流量。
+- **录制进程关联**：用 `python3 demo_traffic.py talk --hold 20` 保持 HTTP 连接打开 20 秒。回到 NetLens，点击「TCP 流…」→「读取本机进程」，再从「全部进程」下拉框选对应进程。
 - **独立验收**：用有抓包权限的账户运行 `python3 demo_traffic.py live-check`，输出报文分类、双向载荷、进程快照命中和停止延迟的 JSON。例如在 macOS 可运行 `sudo /usr/bin/env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 demo_traffic.py live-check`。
 - **重新生成固定样本**：`python3 demo_traffic.py fixture`。
 
