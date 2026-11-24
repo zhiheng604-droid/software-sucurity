@@ -8,6 +8,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 import sys
+from tempfile import mkstemp
 
 from http_stream import HttpInspector
 from packet import _parse_packet
@@ -92,6 +93,11 @@ class Pcap:
             'pcap_freealldevs': (None, (InterfacePtr,)),
             'pcap_open_live': (p, (s, i, i, i, s)),
             'pcap_open_offline': (p, (s, s)),
+            'pcap_open_dead': (p, (i, i)),
+            'pcap_dump_open': (p, (p, s)),
+            'pcap_dump': (None, (p, C.POINTER(Header), s)),
+            'pcap_dump_flush': (i, (p,)),
+            'pcap_dump_close': (None, (p,)),
             'pcap_datalink': (i, (p,)),
             'pcap_compile': (i, (p, bpf, s, i, C.c_uint32)),
             'pcap_setfilter': (i, (p, bpf)),
@@ -138,6 +144,9 @@ class Pcap:
     def error(self, handle):
         return decode(self.lib.pcap_geterr(handle)) or 'libpcap 读取失败'
 
+    def path_bytes(self, path):
+        return str(path).encode('utf-8') if sys.platform == 'win32' and self.utf8 else os.fsencode(path)
+
     def apply_filter(self, handle, expression):
         if not expression.strip():
             return
@@ -152,6 +161,43 @@ class Pcap:
             self.lib.pcap_freecode(C.byref(program))
 
 
+def write_pcap(pcap, path, linktype, packets):
+    """Write the retained records in capture order, replacing the destination on success."""
+    packets = tuple(packets)
+    if not packets:
+        raise ValueError('没有可导出的保留包。')
+    target = Path(path)
+    fd, name = mkstemp(prefix='.netlens-', suffix='.pcap', dir=target.parent)
+    staged = Path(name)
+    lib = pcap.lib
+    try:
+        os.close(fd)
+        snaplen = max(65535, max(packet.captured_length for packet in packets))
+        handle = lib.pcap_open_dead(linktype, snaplen)
+        if not handle:
+            raise RuntimeError('无法创建 PCAP 导出句柄。')
+        try:
+            dumper = lib.pcap_dump_open(handle, pcap.path_bytes(staged))
+            if not dumper:
+                raise RuntimeError(pcap.error(handle))
+            try:
+                for packet in packets:
+                    seconds, micros = divmod(packet.timestamp_us, 1_000_000)
+                    header = Header(PcapTime(seconds, micros), packet.captured_length,
+                                    packet.wire_length)
+                    lib.pcap_dump(dumper, C.byref(header), packet.raw)
+                if lib.pcap_dump_flush(dumper) != 0:
+                    raise OSError('写入 PCAP 失败。请检查目标磁盘的空间与权限。')
+            finally:
+                lib.pcap_dump_close(dumper)
+        finally:
+            lib.pcap_close(handle)
+        staged.replace(target)
+    finally:
+        staged.unlink(missing_ok=True)
+    return len(packets)
+
+
 def run_capture(pcap, request, stop, on_ready, on_packet, result):
     """Read until EOF or stop. Callbacks never access GUI controls directly."""
     lib = pcap.lib
@@ -160,8 +206,7 @@ def run_capture(pcap, request, stop, on_ready, on_packet, result):
     err = C.create_string_buffer(256)
     try:
         if offline:
-            path = request.path.encode('utf-8') if sys.platform == 'win32' and pcap.utf8 else os.fsencode(request.path)
-            handle = lib.pcap_open_offline(path, err)
+            handle = lib.pcap_open_offline(pcap.path_bytes(request.path), err)
         else:
             handle = lib.pcap_open_live(request.interface, 65535, 0, 100, err)
         if not handle:
@@ -172,13 +217,17 @@ def run_capture(pcap, request, stop, on_ready, on_packet, result):
         pcap.apply_filter(handle, request.expression)
         if not offline and lib.pcap_setnonblock(handle, 1, err) < 0:
             raise RuntimeError(decode(err.value))
-        on_ready(linktype)
+        ready = not offline
+        if ready:
+            on_ready(linktype)
 
         http = HttpInspector()
         header, data = C.POINTER(Header)(), C.c_void_p()
         while not stop.is_set():
             status = lib.pcap_next_ex(handle, C.byref(header), C.byref(data))
             if status == -2:
+                if not ready:
+                    on_ready(linktype)
                 result.ended = True
                 break
             if status < 0:
@@ -194,6 +243,9 @@ def run_capture(pcap, request, stop, on_ready, on_packet, result):
             stamp = record.time.seconds * 1_000_000 + record.time.microseconds
             packet = _parse_packet(raw, linktype, result.received, stamp, record.wire)
             http.observe(packet)
+            if not ready:
+                on_ready(linktype)
+                ready = True
             if not on_packet(packet):
                 result.queue_dropped += 1
 

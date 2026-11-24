@@ -10,6 +10,8 @@ python3 main.py --list
 ```
 
 - **离线查看**：点击「加载课程样本」或「打开 PCAP」。样本使用文档示例地址，无需抓包权限。
+- **打开失败时保留旧结果**：尝试打开新文件或新网卡时，先检查来源及 BPF。打开失败时仍可查看、筛选和导出上一轮记录。
+- **导出**：停止抓包或读完文件后，点击「导出 PCAP…」。导出的是当前缓存里全部保留的记录，包括暂时被显示过滤隐藏的行。导出的文件可用「打开 PCAP…」重新读取。
 - **实时抓包**：选择接口，填写可选的 BPF 表达式后点击「开始抓包」。macOS 需要有权限打开 `/dev/bpf*`，Linux 需要平台配置的抓包权限。Windows 安装 Npcap 后用 `py main.py` 启动。
 - **安全复现**：macOS 选 `lo0`，填 `(tcp port 18765) or (udp and host 127.0.0.1)` 并开始抓包。另开终端运行 `python3 demo_traffic.py talk`。它只在 `127.0.0.1` 上产生 HTTP 和 UDP 流量。
 - **录制进程关联**：用 `python3 demo_traffic.py talk --hold 20` 保持 HTTP 连接打开 20 秒。回到 NetLens，点击「TCP 流…」→「读取本机进程」，再从「全部进程」下拉框选对应进程。
@@ -35,7 +37,7 @@ TCP 流统计基于当前保留窗口。载荷字节含重传，不表示应用�
 
 ## 扩展验证
 
-- `python3 verify_offline.py` 检查两个 PCAP。新增的 `netlens_http_split.pcap` 可用「打开 PCAP…」查看。选 HTTP 后可以检查第 6、8 帧及各自的首行来源帧。
+- `python3 verify_offline.py` 检查两个样本、导出往返和不完整文件的启动行为。用「打开 PCAP…」载入 `netlens_http_split.pcap`，选 HTTP 后点击第 6 帧。协议详情里点击「帧 #4」会打开对应的十六进制页，再点「回到重组帧」可回第 6 帧。来源帧被缓存淘汰时会显示不可查看。
 - `python3 demo_traffic.py split-fixture` 重建跨段样本。
 - `sudo /usr/bin/python3 -B verify_extended.py all --duration 2 --trials 3` 在 macOS 回环上验证跨段请求与响应、两客户端 PID 筛选，并完成 12 轮 UDP 性能对照。该脚本只使用回环接口和本机临时端口。可加 `--output result.json` 保存原始记录。
 

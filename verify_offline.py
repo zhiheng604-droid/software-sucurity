@@ -1,4 +1,4 @@
-"""Reproduce the checks for the bundled 15-record fixture with libpcap."""
+"""Check the bundled PCAP fixtures and exported records with libpcap."""
 
 from collections import Counter
 from pathlib import Path
@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from threading import Event
 import unittest
 
-from capture import CaptureRequest, CaptureResult, Pcap, run_capture
+from capture import CaptureRequest, CaptureResult, Pcap, run_capture, write_pcap
 from demo_traffic import make_split_fixture
 from flows import summarize_flows
 
@@ -83,6 +83,47 @@ class OfflineCaptureTests(unittest.TestCase):
         http = [packet for packet in packets if packet.protocol == 'HTTP']
         self.assertEqual(len(http), 1)
         self.assertIn('HTTP/1.1 200 OK', http[0].info)
+
+    def test_export_round_trip_preserves_link_type_lengths_timestamp_and_bytes(self):
+        def read_capture(path):
+            linktypes, packets = [], []
+            result = CaptureResult()
+
+            def retain(packet):
+                packets.append(packet)
+                return True
+
+            run_capture(self.pcap, CaptureRequest(path=str(path)), Event(),
+                        linktypes.append, retain, result)
+            self.assertTrue(result.ended, result.error)
+            self.assertEqual(len(linktypes), 1)
+            return linktypes[0], packets
+
+        with TemporaryDirectory() as folder:
+            for sample in (SAMPLE, SPLIT_SAMPLE):
+                with self.subTest(sample=sample.name):
+                    linktype, packets = read_capture(sample)
+                    destination = Path(folder) / '新导出 测试.pcap'
+                    self.assertEqual(write_pcap(self.pcap, destination, linktype, packets),
+                                     len(packets))
+                    reopened_linktype, reopened = read_capture(destination)
+                    self.assertEqual(linktype, reopened_linktype)
+
+                    def record(p):
+                        return p.timestamp_us, p.captured_length, p.wire_length, p.raw, p.http_frames
+
+                    self.assertEqual(list(map(record, reopened)), list(map(record, packets)))
+
+    def test_invalid_first_record_is_rejected_before_source_is_ready(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / 'incomplete.pcap'
+            path.write_bytes(SAMPLE.read_bytes()[:30])
+            ready = []
+            result = CaptureResult()
+            run_capture(self.pcap, CaptureRequest(path=str(path)), Event(), ready.append,
+                        lambda _: self.fail('unexpected packet'), result)
+        self.assertTrue(result.error)
+        self.assertFalse(ready)
 
 
 if __name__ == '__main__':

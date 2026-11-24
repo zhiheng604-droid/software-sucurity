@@ -11,10 +11,11 @@ import threading
 import time
 import tkinter as tk
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from capture import Pcap, CaptureRequest, CaptureResult, decode, run_capture
+from capture import Pcap, CaptureRequest, CaptureResult, decode, run_capture, write_pcap
 from flows import (find_local_processes, flow_key, flow_process_options,
                    flows_for_process, summarize_flows)
 
@@ -28,6 +29,13 @@ FILTERS = {
     "HTTP": lambda p: p.protocol == "HTTP",
     "ARP": lambda p: p.protocol == "ARP",
 }
+
+
+@dataclass
+class OpeningSource:
+    request: CaptureRequest
+    label: str
+    result: CaptureResult
 
 
 class SnifferApp:
@@ -45,13 +53,20 @@ class SnifferApp:
         self.control = queue.SimpleQueue()
         self.stop_event = threading.Event()
         self.result = CaptureResult()
+        self.opening = None
         self.running = False
         self.closing = False
         self.stream = None
         self.source_label = ''
+        self.source_path = ''
+        self.linktype = None
         self.offline = False
         self.visible = 0
         self.processes = {}
+        self.flow_windows = set()
+        self.source_rows = {}
+        self.pinned_frame = None
+        self.return_frame = None
         self._build_ui()
         self.refresh_interfaces()
         self.root.after(100, self._drain_packets)
@@ -79,20 +94,23 @@ class SnifferApp:
         ttk.Label(toolbar, text="网卡").pack(side="left", padx=(0, 6))
         self.interface_var = tk.StringVar()
         self.interface_box = ttk.Combobox(toolbar, textvariable=self.interface_var,
-                                          state="readonly", width=25)
+                                          state="readonly", width=20)
         self.interface_box.pack(side="left", padx=(0, 6))
-        self.refresh_button = ttk.Button(toolbar, text="刷新", command=self.refresh_interfaces)
+        self.refresh_button = ttk.Button(toolbar, text="刷新", width=-1, command=self.refresh_interfaces)
         self.refresh_button.pack(side="left", padx=(0, 8))
-        self.start_button = ttk.Button(toolbar, text="▶ 开始抓包", command=self.start_capture)
+        self.start_button = ttk.Button(toolbar, text="▶ 开始抓包", width=-1, command=self.start_capture)
         self.start_button.pack(side="left", padx=(0, 6))
-        self.stop_button = ttk.Button(toolbar, text="停止", command=self.stop_capture, state="disabled")
+        self.stop_button = ttk.Button(toolbar, text="停止", width=-1, command=self.stop_capture, state="disabled")
         self.stop_button.pack(side="left", padx=(0, 12))
-        self.open_button = ttk.Button(toolbar, text="打开 PCAP…", command=self.open_file)
+        self.open_button = ttk.Button(toolbar, text="打开 PCAP…", width=-1, command=self.open_file)
         self.open_button.pack(side="left", padx=(0, 6))
-        self.demo_button = ttk.Button(toolbar, text="加载课程样本", command=self.open_demo)
+        self.demo_button = ttk.Button(toolbar, text="加载课程样本", width=-1, command=self.open_demo)
         self.demo_button.pack(side="left")
-        self.clear_button = ttk.Button(toolbar, text="清空", command=self.clear_packets)
+        self.clear_button = ttk.Button(toolbar, text="清空", width=-1, command=self.clear_packets)
         self.clear_button.pack(side="right")
+        self.export_button = ttk.Button(toolbar, text="导出 PCAP…", width=-1, state="disabled",
+                                        command=self.export_file)
+        self.export_button.pack(side="right", padx=(6, 6))
 
         filters = ttk.Frame(self.root, padding=(12, 0, 12, 9))
         filters.pack(fill="x")
@@ -145,6 +163,13 @@ class SnifferApp:
             self.packet_tree.tag_configure(tag, background=color)
         self.packet_tree.bind("<<TreeviewSelect>>", self._show_selected)
 
+        detail_actions = ttk.Frame(details_frame)
+        detail_actions.pack(fill="x")
+        self.return_button = ttk.Button(detail_actions, text="回到重组帧", state="disabled",
+                                        command=self.return_to_http)
+        self.return_button.pack(side="right", padx=(4, 0))
+        self.reference_var = tk.StringVar()
+        ttk.Label(detail_actions, textvariable=self.reference_var).pack(side="left", padx=(4, 0))
         detail_tabs = self.detail_tabs = ttk.Notebook(details_frame)
         detail_tabs.pack(fill="both", expand=True)
         field_tab = ttk.Frame(detail_tabs)
@@ -160,6 +185,10 @@ class SnifferApp:
         self.detail_tree.configure(yscrollcommand=detail_y.set)
         self.detail_tree.pack(side="left", fill="both", expand=True)
         detail_y.pack(side="right", fill="y")
+        self.detail_tree.tag_configure('frame-link', foreground='#07588a')
+        self.detail_tree.tag_configure('frame-missing', foreground='#747474')
+        self.detail_tree.bind('<ButtonRelease-1>', self.open_http_reference)
+        self.detail_tree.bind('<Return>', self.open_http_reference)
         self.hex_text = tk.Text(hex_tab, wrap="none", font=("Menlo", 10), state="disabled")
         hex_y = ttk.Scrollbar(hex_tab, orient="vertical", command=self.hex_text.yview)
         hex_x = ttk.Scrollbar(hex_tab, orient="horizontal", command=self.hex_text.xview)
@@ -208,16 +237,24 @@ class SnifferApp:
     def start_source(self, request, label):
         if self.running:
             return
-        self.clear_packets()
-        self.filter_box.current(0)
-        self.source_label = label
-        self.offline = bool(request.path)
-        self.result = CaptureResult()
+        pending = self.opening = OpeningSource(request, label, CaptureResult())
         self.stop_event.clear()
         self.set_running(True)
         self.status_var.set(f'正在打开 {label}…')
-        worker = threading.Thread(target=self._capture_worker, args=(request,), daemon=True)
+        worker = threading.Thread(target=self._capture_worker, args=(pending,), daemon=True)
         worker.start()
+
+    def _accept_source(self, linktype):
+        pending = self.opening
+        self.opening = None
+        self.source_label = pending.label
+        self.source_path = pending.request.path
+        self.offline = bool(self.source_path)
+        self.result = pending.result
+        self.linktype = linktype
+        self.filter_box.current(0)
+        self._reset_view()
+        self.status_var.set(f'{self.source_label} · 链路类型 {linktype} · 正在读取')
 
     def set_running(self, running):
         self.running = running
@@ -227,10 +264,13 @@ class SnifferApp:
             widget.configure(state=state)
         self.stop_button.configure(state='normal' if running else 'disabled')
         self.interface_box.configure(state='disabled' if running else 'readonly')
+        self._update_export_button()
 
-    def _capture_worker(self, request):
+    def _capture_worker(self, pending):
+        offline = bool(pending.request.path)
+
         def publish(packet):
-            if self.offline:
+            if offline:
                 while not self.stop_event.is_set():
                     try:
                         self.incoming.put(packet, timeout=0.04)
@@ -244,10 +284,10 @@ class SnifferApp:
             except queue.Full:
                 return False
         try:
-            run_capture(self.pcap, request, self.stop_event,
-                        lambda link: self.control.put(('ready', link)), publish, self.result)
+            run_capture(self.pcap, pending.request, self.stop_event,
+                        lambda link: self.control.put(('ready', link)), publish, pending.result)
         except Exception as exc:
-            self.result.error = str(exc)
+            pending.result.error = str(exc)
         finally:
             self.control.put(('done', None))
 
@@ -262,23 +302,35 @@ class SnifferApp:
         while not self.control.empty():
             status, value = self.control.get_nowait()
             if status == 'ready':
-                self.status_var.set(f'{self.source_label} · 链路类型 {value} · 正在读取')
+                if self.opening is not None and not self.stop_event.is_set():
+                    self._accept_source(value)
             elif status == 'done':
                 done = True
         added = False
-        for _ in range(256):
-            try:
-                packet = self.incoming.get_nowait()
-            except queue.Empty:
-                break
-            self._append_packet(packet)
-            added = True
+        # The worker may enqueue its first packet just after this tick checked
+        # the control queue. Hold those packets until the ready event is read.
+        if self.opening is None or done:
+            for _ in range(self.incoming.maxsize):
+                try:
+                    packet = self.incoming.get_nowait()
+                except queue.Empty:
+                    break
+                if self.opening is None:
+                    self._append_packet(packet)
+                    added = True
         if done:
+            pending = self.opening
+            self.opening = None
             self.set_running(False)
             if self.closing:
                 self.root.destroy()
                 return
-            if self.result.error:
+            if pending is not None:
+                reason = (f'打开失败 · {pending.result.error}' if pending.result.error and
+                          not self.stop_event.is_set() else '已取消打开')
+                suffix = f' · 已保留上一来源的 {len(self.packets)} 条记录' if self.packets else ''
+                self.status_var.set(reason + suffix)
+            elif self.result.error:
                 self.status_var.set(f'读取失败 · {self.result.error}')
             else:
                 prefix = '离线读取完成' if self.result.ended and self.offline else '已停止'
@@ -286,6 +338,27 @@ class SnifferApp:
         elif added and self.running and not self.stop_event.is_set():
             self._set_summary('离线读取中' if self.offline else '实时抓包中')
         self.root.after(60, self._drain_packets)
+
+    def _update_export_button(self):
+        enabled = not self.running and self.linktype is not None and bool(self.packets)
+        self.export_button.configure(state='normal' if enabled else 'disabled')
+
+    def export_file(self):
+        if self.running or self.linktype is None or not self.packets:
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title='导出全部保留包', defaultextension='.pcap',
+            initialfile='netlens-capture.pcap', filetypes=[('PCAP', '*.pcap')])
+        if not path:
+            return
+        try:
+            if self.source_path and Path(path).resolve() == Path(self.source_path).resolve():
+                raise ValueError('请另存为新的文件，避免覆盖打开的捕获文件。')
+            count = write_pcap(self.pcap, path, self.linktype, self.packets.values())
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.status_var.set(f'导出失败 · {exc}')
+            return
+        self.status_var.set(f'已导出 {count} 条保留记录 · {Path(path).name}')
 
     def _set_summary(self, state):
         result = self.result
@@ -296,6 +369,8 @@ class SnifferApp:
         self.status_var.set(f'{state} · {self.source_label} · {counts}')
 
     def _matches(self, packet):
+        if packet.number == self.pinned_frame:
+            return True
         predicate = FILTERS[self.filter_var.get()]
         return ((predicate is None or predicate(packet)) and
                 (self.stream is None or flow_key(packet) == self.stream))
@@ -307,6 +382,9 @@ class SnifferApp:
             number, old = self.packets.popitem(last=False)
             self.buffer_bytes -= len(old.raw)
             self.evicted += 1
+            if number == self.pinned_frame:
+                self.pinned_frame = None
+                self.reference_var.set(f'来源帧 #{number} 已从缓存淘汰')
             iid = str(number)
             if self.packet_tree.exists(iid):
                 self.packet_tree.delete(iid)
@@ -319,9 +397,10 @@ class SnifferApp:
         stamp = time.strftime('%H:%M:%S', time.localtime(seconds)) + f'.{micros // 1000:03d}'
         length = (packet.captured_length if packet.captured_length == packet.wire_length
                   else f'{packet.captured_length}/{packet.wire_length}')
+        info = f'来源帧 · {packet.info}' if packet.number == self.pinned_frame else packet.info
         self.packet_tree.insert('', 'end', iid=str(packet.number), tags=(packet.protocol,), values=(
             packet.number, stamp, packet.source, packet.destination,
-            packet.protocol, length, packet.info))
+            packet.protocol, length, info))
         self.visible += 1
 
     def _refresh_rows(self):
@@ -344,13 +423,25 @@ class SnifferApp:
 
     def _show_selected(self, _event=None):
         packet = self._selected_packet()
+        self.source_rows.clear()
         self.detail_tree.delete(*self.detail_tree.get_children())
         self.hex_text.configure(state='normal')
         self.hex_text.delete('1.0', 'end')
         if packet is not None:
             parent = ''
-            for key, value in packet.detail:
-                if value == '':
+            details = sorted(packet.detail, key=lambda item: not item[0].startswith(
+                ('HTTP/1.x start line', 'HTTP 首行来源帧')))
+            for key, value in details:
+                if key.startswith('HTTP 首行来源帧') and len(packet.http_frames) > 1:
+                    group = self.detail_tree.insert('', 'end', text=key, values=(value,), open=True)
+                    for number in packet.http_frames:
+                        retained = number in self.packets
+                        detail = '点击查看原始字节' if retained else '已淘汰或未进入界面缓存'
+                        tag = 'frame-link' if retained else 'frame-missing'
+                        row = self.detail_tree.insert(group, 'end', text=f'帧 #{number}',
+                                                      values=(detail,), tags=(tag,))
+                        self.source_rows[row] = number
+                elif value == '':
                     parent = self.detail_tree.insert('', 'end', text=key, open=True)
                 else:
                     self.detail_tree.insert(parent if key.startswith('  ') else '',
@@ -364,14 +455,67 @@ class SnifferApp:
             self.hex_text.insert('1.0', '\n'.join(lines))
         self.hex_text.configure(state='disabled')
 
+    def _select_frame(self, number):
+        row = str(number)
+        if not self.packet_tree.exists(row):
+            return False
+        self.packet_tree.selection_set(row)
+        self.packet_tree.focus(row)
+        self.packet_tree.see(row)
+        self._show_selected()
+        return True
+
+    def open_http_reference(self, event):
+        row = (self.detail_tree.identify_row(event.y) if event.num == 1
+               else self.detail_tree.focus())
+        number = self.source_rows.get(row)
+        origin = self._selected_packet()
+        if number is None or origin is None:
+            return
+        if number not in self.packets:
+            self.reference_var.set(f'来源帧 #{number} 已淘汰或未进入界面缓存')
+            self._show_selected()
+            return 'break'
+        self.return_frame = origin.number
+        self.pinned_frame = number
+        self._refresh_rows()
+        self._select_frame(number)
+        self.detail_tabs.select(self.hex_tab)
+        packet = self.packets[number]
+        if packet.tcp is not None:
+            self.hex_text.see(f'{packet.tcp.payload_offset // 16 + 1}.0')
+        self.reference_var.set(f'来源帧 #{number} · 来自重组帧 #{origin.number}')
+        self.return_button.configure(state='normal')
+        return 'break'
+
+    def return_to_http(self):
+        number = self.return_frame
+        self.return_frame = self.pinned_frame = None
+        self.return_button.configure(state='disabled')
+        self.reference_var.set('')
+        self._refresh_rows()
+        self.detail_tabs.select(0)
+        if number is not None and not self._select_frame(number):
+            message = ('在当前筛选下不可见' if number in self.packets else '已从缓存淘汰')
+            self.reference_var.set(f'重组帧 #{number} {message}')
+
     def clear_packets(self):
         if self.running:
             return
+        self._reset_view()
+
+    def _reset_view(self):
         self.packets.clear()
         self.buffer_bytes = self.evicted = 0
         self.stream = None
         self.processes = {}
+        self.pinned_frame = self.return_frame = None
+        self.reference_var.set('')
+        self.return_button.configure(state='disabled')
+        for window in tuple(self.flow_windows):
+            window.destroy()
         self._refresh_rows()
+        self._update_export_button()
 
     def follow_selected(self):
         packet = self._selected_packet()
@@ -389,6 +533,13 @@ class SnifferApp:
 
     def open_flows(self):
         window = tk.Toplevel(self.root)
+        self.flow_windows.add(window)
+
+        def forget(event):
+            if event.widget is window:
+                self.flow_windows.discard(window)
+
+        window.bind('<Destroy>', forget)
         window.title('NetLens · TCP 双向流')
         window.geometry('1040x380')
         frame = ttk.Frame(window, padding=10)
@@ -441,10 +592,12 @@ class SnifferApp:
             snapshot_button.configure(state='disabled')
             note.set('正在读取本机套接字快照…')
             threading.Thread(target=lambda: outcome.put(find_local_processes()), daemon=True).start()
-            window.after(60, receive_snapshot)
+            self.root.after(60, receive_snapshot)
         def receive_snapshot():
+            if not window.winfo_exists():
+                return
             if outcome.empty():
-                window.after(60, receive_snapshot)
+                self.root.after(60, receive_snapshot)
                 return
             self.processes, reason = outcome.get()
             note.set(reason or '进程快照已更新，仅匹配仍存在且当前账号可见的连接。')
