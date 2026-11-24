@@ -54,5 +54,6 @@ TCP 流统计基于当前保留窗口。载荷字节含重传，不表示应用�
 - 用「打开 PCAP…」载入 `netlens_tcp_reuse.pcap`，打开「TCP 流…」可查看端点相同的连接 #1 和 #5。用 `python3 demo_traffic.py reuse-fixture` 重建该样本。
 - `sudo /usr/bin/python3 -B verify_extended.py all --duration 2 --trials 3` 在 macOS 回环上验证跨段请求与响应、两客户端 PID 筛选，并完成 12 轮 UDP 性能对照。该脚本只使用回环接口和本机临时端口。可加 `--output result.json` 保存原始记录。
 - `python3 -B verify_gui_perf.py --replay --duration 2 --trials 3` 用定速 PCAP 回放测实际 Tk 列表。去掉 `--replay` 后使用本机回环实时抓包，需有抓包权限。脚本记录队列丢弃、保留数和界面回调延迟。
+- `python3 -B verify_gui_perf.py --display-filter --duration 2 --trials 3 --output live-display.json` 使用回环网卡实测组合显示过滤。脚本交替发向两个本机端口，显示表达式只命中其中一个。JSON 按报文编号核对采集、出队和显示，记录发送到列表插入、解析后到列表插入的 P50、P95、P99 和最大延迟。macOS 上使用有抓包权限且带 Tk 的 Python 运行。
 
 HTTP/1.x 首行重组按方向最多跟踪 512 字节，识别成功时列出来源帧。支持已看到 SYN 时的乱序、重传和序号回绕。连接中途开始采集时，只能从能识别的首行前缀开始。保留现有单段检测用于后续请求。当前版本不做完整 TCP 字节流或 HTTP 消息体重组、TLS 解密和多接口同时采集。Windows Npcap 和 Linux 实机尚未验证。

@@ -176,7 +176,11 @@ def http_and_processes(pcap, interface):
             'packet_count': capture.result.received, 'stop_ms': capture.stop_ms}
 
 
-def pace_udp(sender, destinations, rate, duration):
+def udp_payload(index):
+    return MAGIC + struct.pack('!I', index) + bytes(PAYLOAD_SIZE - len(MAGIC) - 4)
+
+
+def pace_udp(sender, destinations, rate, duration, make_payload=udp_payload):
     goal = round(rate * duration)
     counts = [0, 0]
     begin = time.monotonic()
@@ -186,7 +190,7 @@ def pace_udp(sender, destinations, rate, duration):
         if remaining > 0:
             time.sleep(remaining)
         target = index % 2
-        data = MAGIC + struct.pack('!I', index) + bytes(PAYLOAD_SIZE - len(MAGIC) - 4)
+        data = make_payload(index)
         if sender.sendto(data, destinations[target]) == len(data):
             counts[target] += 1
     return counts, time.monotonic() - begin

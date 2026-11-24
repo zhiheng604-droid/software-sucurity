@@ -14,6 +14,9 @@ from flows import ConnectionTracker
 from http_stream import HttpInspector
 from packet import _parse_packet
 
+CAPTURE_ACTIVE_WAIT = 0.004
+CAPTURE_IDLE_WAIT = 0.015
+
 
 class Interface(C.Structure):
     pass
@@ -225,6 +228,7 @@ def run_capture(pcap, request, stop, on_ready, on_packet, result):
         http = HttpInspector()
         connections = ConnectionTracker()
         header, data = C.POINTER(Header)(), C.c_void_p()
+        empty_wait = CAPTURE_IDLE_WAIT
         while not stop.is_set():
             status = lib.pcap_next_ex(handle, C.byref(header), C.byref(data))
             if status == -2:
@@ -235,8 +239,10 @@ def run_capture(pcap, request, stop, on_ready, on_packet, result):
             if status < 0:
                 raise RuntimeError(pcap.error(handle))
             if status == 0:
-                stop.wait(0.015)
+                stop.wait(empty_wait)
+                empty_wait = min(CAPTURE_IDLE_WAIT, 2 * empty_wait)
                 continue
+            empty_wait = CAPTURE_ACTIVE_WAIT
             record = header.contents
             result.received += 1
             if record.captured > 262144 or record.captured > record.wire:

@@ -28,6 +28,8 @@ FILTERS = {
 QUEUE_CAPACITY = 2048
 GUI_BATCH_LIMIT = 512
 GUI_BATCH_SECONDS = 0.006
+GUI_IDLE_DELAY_MS = 16
+GUI_LIVE_DELAY_MS = 6
 
 @dataclass
 class OpeningSource:
@@ -364,9 +366,9 @@ class SnifferApp:
             if now - self.last_summary_at >= 0.1:
                 self.last_summary_at = now
                 self._set_summary('离线读取中' if self.offline else '实时抓包中')
-        # Yield to Tk between slices. Do not wait a full timer interval while
-        # packets are already queued, or mark the capture finished before drain.
-        self.root.after(1 if backlog else 16, self._drain_packets)
+        # Yield between batches and check sooner when live packets just arrived.
+        delay = GUI_LIVE_DELAY_MS if added and self.running and not self.offline else GUI_IDLE_DELAY_MS
+        self.root.after(1 if backlog else delay, self._drain_packets)
 
     def _update_export_button(self):
         enabled = not self.running and self.linktype is not None and bool(self.packets)
