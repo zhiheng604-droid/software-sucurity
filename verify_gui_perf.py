@@ -227,6 +227,7 @@ class GuiPerformance:
         report = {
             'interface': self.source,
             'window_mapped': self.window_mapped,
+            'gui_dispatch': 'live_idle_batches' if hasattr(self.app, 'queue_signal') else 'timer',
             'configured_pps': self.rate,
             'sent': sent,
             'send_seconds': round(self.elapsed, 4),

@@ -29,7 +29,9 @@ QUEUE_CAPACITY = 2048
 GUI_BATCH_LIMIT = 512
 GUI_BATCH_SECONDS = 0.006
 GUI_IDLE_DELAY_MS = 16
-GUI_LIVE_DELAY_MS = 6
+GUI_LIVE_INTERVAL = 0.010
+GUI_LIVE_IDLE_WAIT = 0.002
+GUI_LIVE_IDLE_GRACE = 0.040
 
 @dataclass
 class OpeningSource:
@@ -54,6 +56,9 @@ class SnifferApp:
         self.worker_done = False
         self.last_summary_at = 0.0
         self.stop_event = threading.Event()
+        self.queue_signal = threading.Event()
+        self.live_idle_until = 0.0
+        self.next_live_batch = 0.0
         self.result = CaptureResult()
         self.opening = None
         self.running = False
@@ -73,7 +78,8 @@ class SnifferApp:
         self.return_frame = None
         self._build_ui()
         self.refresh_interfaces()
-        self.root.after(100, self._drain_packets)
+        self._drain_after = self.root.after(100, self._drain_packets)
+        self.root.bind('<Destroy>', self._cancel_drain, add='+')
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def _build_ui(self) -> None:
@@ -260,6 +266,8 @@ class SnifferApp:
         self.worker_done = False
         self.last_summary_at = 0.0
         self.stop_event.clear()
+        self.live_idle_until = 0.0
+        self.next_live_batch = 0.0
         self.set_running(True)
         self.status_var.set(f'正在打开 {label}…')
         worker = threading.Thread(target=self._capture_worker, args=(pending,), daemon=True)
@@ -291,6 +299,10 @@ class SnifferApp:
     def _capture_worker(self, pending):
         offline = bool(pending.request.path)
 
+        def post(status, value):
+            self.control.put((status, value))
+            self.queue_signal.set()
+
         def publish(packet):
             if offline:
                 while not self.stop_event.is_set():
@@ -302,16 +314,18 @@ class SnifferApp:
                 return False
             try:
                 self.incoming.put_nowait(packet)
+                if not self.queue_signal.is_set():
+                    self.queue_signal.set()
                 return True
             except queue.Full:
                 return False
         try:
             run_capture(self.pcap, pending.request, self.stop_event,
-                        lambda link: self.control.put(('ready', link)), publish, pending.result)
+                        lambda link: post('ready', link), publish, pending.result)
         except Exception as exc:
             pending.result.error = str(exc)
         finally:
-            self.control.put(('done', None))
+            post('done', None)
 
     def stop_capture(self):
         if self.running:
@@ -319,7 +333,28 @@ class SnifferApp:
             self.stop_button.configure(state='disabled')
             self.status_var.set('正在停止…')
 
+    def _schedule_live_drain(self):
+        # Let pending Tk events and redraws run before the next live batch.
+        self._drain_after = self.root.after_idle(self._arm_live_drain)
+
+    def _arm_live_drain(self):
+        # A timer keeps update_idletasks() from looping on our idle callback.
+        self._drain_after = self.root.after(0, self._drain_live)
+
+    def _drain_live(self):
+        remaining = self.next_live_batch - time.monotonic()
+        if remaining > 0 and not self.stop_event.is_set():
+            self.stop_event.wait(min(remaining, GUI_LIVE_IDLE_WAIT))
+            if time.monotonic() < self.next_live_batch and not self.stop_event.is_set():
+                self._schedule_live_drain()
+                return
+        elif not self.stop_event.is_set():
+            self.queue_signal.wait(GUI_LIVE_IDLE_WAIT)
+        self._drain_packets()
+
     def _drain_packets(self):
+        self._drain_after = None
+        self.queue_signal.clear()
         while not self.control.empty():
             status, value = self.control.get_nowait()
             if status == 'ready':
@@ -366,9 +401,23 @@ class SnifferApp:
             if now - self.last_summary_at >= 0.1:
                 self.last_summary_at = now
                 self._set_summary('离线读取中' if self.offline else '实时抓包中')
-        # Yield between batches and check sooner when live packets just arrived.
-        delay = GUI_LIVE_DELAY_MS if added and self.running and not self.offline else GUI_IDLE_DELAY_MS
-        self.root.after(1 if backlog else delay, self._drain_packets)
+        if self.running and not self.offline and added:
+            now = time.monotonic()
+            self.live_idle_until = now + GUI_LIVE_IDLE_GRACE
+            self.next_live_batch = now + GUI_LIVE_INTERVAL
+        if backlog:
+            self._drain_after = self.root.after(1, self._drain_packets)
+        elif self.running and not self.offline and time.monotonic() < self.live_idle_until:
+            self._schedule_live_drain()
+        else:
+            self._drain_after = self.root.after(GUI_IDLE_DELAY_MS, self._drain_packets)
+
+    def _cancel_drain(self, event):
+        if event.widget is self.root:
+            self.stop_event.set()
+            if self._drain_after is not None:
+                self.root.after_cancel(self._drain_after)
+                self._drain_after = None
 
     def _update_export_button(self):
         enabled = not self.running and self.linktype is not None and bool(self.packets)

@@ -56,4 +56,6 @@ TCP 流统计基于当前保留窗口。载荷字节含重传，不表示应用�
 - `python3 -B verify_gui_perf.py --replay --duration 2 --trials 3` 用定速 PCAP 回放测实际 Tk 列表。去掉 `--replay` 后使用本机回环实时抓包，需有抓包权限。脚本记录队列丢弃、保留数和界面回调延迟。
 - `python3 -B verify_gui_perf.py --display-filter --duration 2 --trials 3 --output live-display.json` 使用回环网卡实测组合显示过滤。脚本交替发向两个本机端口，显示表达式只命中其中一个。JSON 按报文编号核对采集、出队和显示，记录发送到列表插入、解析后到列表插入的 P50、P95、P99 和最大延迟。macOS 上使用有抓包权限且带 Tk 的 Python 运行。
 
+实时有流量时，Tk 在空闲回调后以约 10 ms 为间隔合批更新列表。工作线程入队后发出队列信号。短时没有新流量后恢复普通定时检查。性能 JSON 的 `gui_dispatch` 标记采用的界面调度策略。
+
 HTTP/1.x 首行重组按方向最多跟踪 512 字节，识别成功时列出来源帧。支持已看到 SYN 时的乱序、重传和序号回绕。连接中途开始采集时，只能从能识别的首行前缀开始。保留现有单段检测用于后续请求。当前版本不做完整 TCP 字节流或 HTTP 消息体重组、TLS 解密和多接口同时采集。Windows Npcap 和 Linux 实机尚未验证。
