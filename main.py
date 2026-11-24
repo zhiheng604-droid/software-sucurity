@@ -15,7 +15,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from capture import Pcap, CaptureRequest, CaptureResult, decode, run_capture
-from flows import flow_key, summarize_flows, find_local_processes
+from flows import (find_local_processes, flow_key, flow_process_options,
+                   flows_for_process, summarize_flows)
 
 FILTERS = {
     "全部": None,
@@ -412,21 +413,25 @@ class SnifferApp:
         process_picker = ttk.Combobox(actions, textvariable=process_name, width=16,
                                       values=['全部进程'], state='readonly')
 
-
         def refresh():
             table.delete(*table.get_children())
             keys.clear()
-            for i, flow in enumerate(summarize_flows(self.packets.values())):
+            flows = summarize_flows(self.packets.values())
+            options = flow_process_options(flows, self.processes)
+            current = process_name.get()
+            process_picker.configure(values=['全部进程', *options])
+            if current not in options:
+                process_picker.current(0)
+            selected_pid = options.get(process_name.get())
+            for i, flow in enumerate(flows_for_process(flows, self.processes, selected_pid)):
                 processes = self.processes.get(flow.key, ())
-                if process_picker.current() != 0 and process_name.get() not in processes:
-                    continue
                 a, b = flow.key
                 iid = str(i)
                 keys[iid] = flow.key
                 table.insert('', 'end', iid=iid, values=(
                     endpoint(a), endpoint(b), ' / '.join(map(str, flow.counts)),
                     ' / '.join(map(str, flow.bytes)), f'{(flow.latest - flow.earliest) / 1_000_000:.3f}',
-                    flow.state, ', '.join(sorted(processes))))
+                    flow.state, ', '.join(owner.label for owner in sorted(processes))))
         def follow(_event=None):
             selected = table.selection()
             if selected:
@@ -442,9 +447,6 @@ class SnifferApp:
                 window.after(60, receive_snapshot)
                 return
             self.processes, reason = outcome.get()
-            names = sorted({process for items in self.processes.values() for process in items})
-            process_picker.configure(values=['全部进程', *names])
-            process_picker.current(0)
             note.set(reason or '进程快照已更新，仅匹配仍存在且当前账号可见的连接。')
             snapshot_button.configure(state='normal')
             refresh()

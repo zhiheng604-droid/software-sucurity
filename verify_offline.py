@@ -2,13 +2,16 @@
 
 from collections import Counter
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Event
 import unittest
 
 from capture import CaptureRequest, CaptureResult, Pcap, run_capture
+from demo_traffic import make_split_fixture
 from flows import summarize_flows
 
 SAMPLE = Path(__file__).resolve().with_name('netlens_demo.pcap')
+SPLIT_SAMPLE = SAMPLE.with_name('netlens_http_split.pcap')
 
 
 class OfflineCaptureTests(unittest.TestCase):
@@ -16,14 +19,14 @@ class OfflineCaptureTests(unittest.TestCase):
     def setUpClass(cls):
         cls.pcap = Pcap()
 
-    def read(self, expression=''):
+    def read(self, expression='', path=SAMPLE):
         result, packets = CaptureResult(), []
 
         def retain(packet):
             packets.append(packet)
             return True
 
-        run_capture(self.pcap, CaptureRequest(path=str(SAMPLE), expression=expression),
+        run_capture(self.pcap, CaptureRequest(path=str(path), expression=expression),
                     Event(), lambda _: None, retain, result)
         return result, packets
 
@@ -62,6 +65,24 @@ class OfflineCaptureTests(unittest.TestCase):
         self.assertEqual(packets[13].protocol, 'UDP')
         self.assertEqual((packets[14].captured_length, packets[14].wire_length), (32, 104))
         self.assertIn('Truncated IPv4', packets[14].info)
+
+    def test_http_across_segments_with_reordering_retransmission_and_wrap(self):
+        state, packets = self.read(path=SPLIT_SAMPLE)
+        self.assertTrue(state.ended, state.error)
+        http = [packet for packet in packets if packet.protocol == 'HTTP']
+        self.assertEqual([p.number for p in http], [6, 8])
+        self.assertEqual([p.http_frames for p in http], [(4, 6, 3), (7, 8)])
+        self.assertIn('GET /split HTTP/1.1', http[0].info)
+        self.assertIn('HTTP/1.1 200 OK', http[1].info)
+
+    def test_http_gap_is_not_filled_by_unrelated_bytes(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / 'missing.pcap'
+            make_split_fixture(path, omit_middle=True)
+            _, packets = self.read(path=path)
+        http = [packet for packet in packets if packet.protocol == 'HTTP']
+        self.assertEqual(len(http), 1)
+        self.assertIn('HTTP/1.1 200 OK', http[0].info)
 
 
 if __name__ == '__main__':

@@ -84,12 +84,48 @@ def make_fixture(path):
     frames.append(ethernet(arp, 0x0806))
     frames.append(ethernet(struct.pack('!HH', 7, 0x0800) + ip4(udp, 17, a, b), 0x8100))
     frames.append(frames[3])  # Separately truncate this copy at capture time.
+    write_fixture(path, frames, truncate_last=True)
+
+
+def write_fixture(path, frames, truncate_last=False):
     with path.open('wb') as file:
         file.write(struct.pack('<IHHIIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
         for index, frame in enumerate(frames):
-            captured = frame[:32] if index == len(frames) - 1 else frame
+            captured = frame[:32] if truncate_last and index == len(frames) - 1 else frame
             file.write(struct.pack('<IIII', STAMP, 1000 + index * 20000, len(captured), len(frame)))
             file.write(captured)
+
+
+def make_split_fixture(path, omit_middle=False):
+    """Capture order deliberately differs from stream order in the request."""
+    a = ip_address('192.0.2.10').packed
+    b = ip_address('198.51.100.20').packed
+    isn = 0xfffffffc
+    start = isn + 1
+    head, mid, tail = b'GE', b'T /split HTTP/1.1\r', b'\n'
+    server = 201
+    end = (start + len(head + mid + tail)) & 0xffffffff
+    rows = [
+        (False, isn, 0, 0x02, b''),
+        (True, server - 1, start, 0x12, b''),
+        (False, start + len(head + mid), server, 0x18, tail),
+        (False, start, server, 0x18, head),
+        (False, start, server, 0x18, head),  # Exact retransmission.
+    ]
+    if not omit_middle:
+        rows.append((False, start + len(head), server, 0x18, mid))
+    rows.extend([
+        (True, server, end, 0x18, b'HTTP/'),
+        (True, server + 5, end, 0x18, b'1.1 200 OK\r\n'),
+        (False, start, server, 0x18, head),
+    ])
+    frames = []
+    for reverse, seq, ack, flags, payload in rows:
+        source, target = (b, a) if reverse else (a, b)
+        sport, dport = (PORT, 50000) if reverse else (50000, PORT)
+        segment = tcp(source, target, sport, dport, seq & 0xffffffff, ack, flags, payload)
+        frames.append(ethernet(ip4(segment, 6, source, target), 0x0800))
+    write_fixture(path, frames)
 
 
 class DemoHandler(BaseHTTPRequestHandler):
@@ -192,7 +228,7 @@ def verify_live(output):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['fixture', 'talk', 'live-check'])
+    parser.add_argument('mode', choices=['fixture', 'split-fixture', 'talk', 'live-check'])
     parser.add_argument('--output', help='Output path for the fixture or live-check JSON')
     parser.add_argument('--hold', type=int, default=0, metavar='SECONDS',
                         help='Keep the loopback HTTP connection open for the recording')
@@ -201,6 +237,8 @@ if __name__ == '__main__':
         parser.error('--hold takes 0–120 seconds and applies only to talk')
     if args.mode == 'fixture':
         make_fixture(Path(args.output) if args.output else HERE / 'netlens_demo.pcap')
+    elif args.mode == 'split-fixture':
+        make_split_fixture(Path(args.output) if args.output else HERE / 'netlens_http_split.pcap')
     elif args.mode == 'talk':
         print('HTTP and UDP loopback complete. Local process match:', generate(args.hold))
     else:

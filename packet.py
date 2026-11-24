@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ipaddress
-import re
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -16,12 +15,6 @@ DLT_IPV4 = 228
 DLT_IPV6 = 229
 DLT_LINUX_SLL = 113
 DLT_LINUX_SLL2 = 276
-HTTP_START = re.compile(
-    rb'(?:HTTP/1\.[01] [1-5][0-9]{2}(?: [ -~]*)?|'
-    rb'(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH|CONNECT|TRACE) [!-~]+ HTTP/1\.[01])'
-)
-
-
 @dataclass(frozen=True)
 class TcpSegment:
     source_port: int
@@ -29,6 +22,7 @@ class TcpSegment:
     sequence: int
     flags: int
     payload_length: int
+    payload_offset: int
 
 
 @dataclass
@@ -44,6 +38,7 @@ class Packet:
     detail: List[Tuple[str, str]]
     raw: bytes
     tcp: Optional[TcpSegment] = None
+    http_frames: Tuple[int, ...] = ()
 
 
 def _u16(data: bytes, pos: int) -> int:
@@ -247,7 +242,7 @@ def _parse_transport(raw, pos, proto_num, version, detail):
                        ("  Flags", ", ".join(n for bit, n in [(0x02, "SYN"), (0x10, "ACK"),
                            (0x01, "FIN"), (0x04, "RST"), (0x08, "PSH"), (0x20, "URG")]
                            if flags & bit) or "none"), ("  Window", str(_u16(raw, pos + 14)))])
-        payload = raw[pos + header_len:]
+        payload_offset = pos + header_len
         summary = f"{sport} → {dport}"
         if flags & 0x02:
             summary += " [SYN, ACK]" if flags & 0x10 else " [SYN]"
@@ -255,12 +250,7 @@ def _parse_transport(raw, pos, proto_num, version, detail):
             summary += " [FIN]"
         if flags & 0x04:
             summary += " [RST]"
-        segment = TcpSegment(sport, dport, seq, flags, len(payload))
-        first, separator, _ = payload[:512].partition(b"\r\n")
-        if separator and HTTP_START.fullmatch(first):
-            text = first.decode("ascii")
-            detail.append(("HTTP/1.x start line", text))
-            return "HTTP", f"{summary} | {text[:100]}", segment
+        segment = TcpSegment(sport, dport, seq, flags, len(raw) - payload_offset, payload_offset)
         return "TCP", summary, segment
     if proto_num == 17:
         if len(raw) < pos + 8:

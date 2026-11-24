@@ -33,4 +33,10 @@ TCP 流统计基于当前保留窗口。载荷字节含重传，不表示应用�
 | `demo_traffic.py` | 本地流量与可复现的样本生成 |
 | `netlens_demo.pcap` | 含 15 条记录的固定课程样本 |
 
-明文 HTTP/1.x 分类要求在一个捕获 TCP 段内看到完整首行。当前版本支持常见链路类型、有限协议字段和部分 PCAPNG 格式，不做 TCP 字节流重组、TLS 解密或多接口同时采集。Windows Npcap 和 Linux 实机尚未验证。
+## 扩展验证
+
+- `python3 verify_offline.py` 检查两个 PCAP。新增的 `netlens_http_split.pcap` 可用「打开 PCAP…」查看。选 HTTP 后可以检查第 6、8 帧及各自的首行来源帧。
+- `python3 demo_traffic.py split-fixture` 重建跨段样本。
+- `sudo /usr/bin/python3 -B verify_extended.py all --duration 2 --trials 3` 在 macOS 回环上验证跨段请求与响应、两客户端 PID 筛选，并完成 12 轮 UDP 性能对照。该脚本只使用回环接口和本机临时端口。可加 `--output result.json` 保存原始记录。
+
+HTTP/1.x 首行重组按方向最多跟踪 512 字节，识别成功时列出来源帧。支持已看到 SYN 时的乱序、重传和序号回绕。连接中途开始采集时，只能从能识别的首行前缀开始。保留现有单段检测用于后续请求。当前版本不做完整 TCP 字节流或 HTTP 消息体重组、TLS 解密和多接口同时采集。Windows Npcap 和 Linux 实机尚未验证。

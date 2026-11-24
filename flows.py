@@ -66,6 +66,27 @@ def summarize_flows(packets):
     return sorted(flows.values(), key=lambda flow: flow.latest, reverse=True)
 
 
+@dataclass(frozen=True, order=True)
+class SocketOwner:
+    pid: int
+    command: str
+
+    @property
+    def label(self):
+        return f'{self.command} ({self.pid})'
+
+
+def flows_for_process(flows, sockets, pid=None):
+    """Apply the same PID filter in the flow window and in verification."""
+    return [flow for flow in flows
+            if pid is None or any(owner.pid == pid for owner in sockets.get(flow.key, ()))]
+
+
+def flow_process_options(flows, sockets):
+    owners = {owner for flow in flows for owner in sockets.get(flow.key, ())}
+    return {owner.label: owner.pid for owner in sorted(owners)}
+
+
 def _endpoint(value):
     address, port = value.rsplit(':', 1)
     address = address.strip('[]').split('%', 1)[0]
@@ -83,10 +104,11 @@ def find_local_processes():
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {}, f'无法读取本机 TCP 进程快照 · {exc}'
     sockets = {}
-    pid, command = '', ''
+    pid, command = None, ''
     for line in result.stdout.splitlines():
         if line.startswith('p'):
-            pid, command = line[1:], ''
+            value = line[1:]
+            pid, command = (int(value) if value.isdecimal() else None), ''
         elif line.startswith('c'):
             command = line[1:]
         elif line.startswith('n') and '->' in line and pid:
@@ -95,5 +117,5 @@ def find_local_processes():
                 key = tuple(sorted((_endpoint(left), _endpoint(right))))
             except ValueError:
                 continue
-            sockets.setdefault(key, set()).add(f'{command} ({pid})')
+            sockets.setdefault(key, set()).add(SocketOwner(pid, command or 'PID'))
     return sockets, '' if sockets else '当前快照没有可关联的已连接 TCP 套接字。'
