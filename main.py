@@ -16,18 +16,13 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from capture import Pcap, CaptureRequest, CaptureResult, decode, run_capture, write_pcap
+from display_filter import DisplayFilterError, PROTOCOLS, compile_display_filter
 from flows import (bind_processes, find_local_processes, flow_identity, flow_process_options,
                    flows_for_process, summarize_flows)
 
 FILTERS = {
     "全部": None,
-    "TCP": lambda p: p.protocol == "TCP" or p.protocol == "HTTP",
-    "UDP": lambda p: p.protocol == "UDP",
-    "IPv4": lambda p: any(k == "IPv4" for k, _ in p.detail),
-    "IPv6": lambda p: any(k == "IPv6" for k, _ in p.detail),
-    "ICMP": lambda p: p.protocol in ("ICMP", "ICMPv6"),
-    "HTTP": lambda p: p.protocol == "HTTP",
-    "ARP": lambda p: p.protocol == "ARP",
+    **{name: PROTOCOLS[name.lower()] for name in ("TCP", "UDP", "IPv4", "IPv6", "ICMP", "HTTP", "ARP")},
 }
 
 QUEUE_CAPACITY = 2048
@@ -67,10 +62,12 @@ class SnifferApp:
         self.linktype = None
         self.offline = False
         self.visible = 0
+        self.display_predicate = None
         self.processes = {}
         self.flow_windows = set()
         self.source_rows = {}
         self.pinned_frame = None
+        self.pinned_spans = ()
         self.return_frame = None
         self._build_ui()
         self.refresh_interfaces()
@@ -132,6 +129,20 @@ class SnifferApp:
         ttk.Button(filters, text="TCP 流…", command=self.open_flows).pack(side="left", padx=(0, 5))
         ttk.Button(filters, text="跟踪所选包", command=self.follow_selected).pack(side="left", padx=(0, 5))
         ttk.Button(filters, text="取消跟踪", command=lambda: self.set_stream(None)).pack(side="left")
+
+        display = ttk.Frame(self.root, padding=(12, 0, 12, 9))
+        display.pack(fill="x")
+        ttk.Label(display, text="组合显示过滤").pack(side="left", padx=(0, 5))
+        self.display_var = tk.StringVar()
+        self.display_entry = ttk.Entry(display, textvariable=self.display_var, width=34)
+        self.display_entry.pack(side="left", fill="x", padx=(0, 6))
+        self.display_entry.bind("<Return>", self.apply_display_filter)
+        self.display_apply_button = ttk.Button(display, text="应用", command=self.apply_display_filter)
+        self.display_apply_button.pack(side="left", padx=(0, 5))
+        self.display_clear_button = ttk.Button(display, text="清除表达式", command=self.clear_display_filter)
+        self.display_clear_button.pack(side="left", padx=(0, 8))
+        self.display_status = tk.StringVar()
+        ttk.Label(display, textvariable=self.display_status).pack(side="left")
 
         self.status_var = tk.StringVar(value="就绪")
         status = ttk.Label(self.root, textvariable=self.status_var, padding=(12, 4), anchor="w")
@@ -195,6 +206,7 @@ class SnifferApp:
         self.detail_tree.bind('<ButtonRelease-1>', self.open_http_reference)
         self.detail_tree.bind('<Return>', self.open_http_reference)
         self.hex_text = tk.Text(hex_tab, wrap="none", font=("Menlo", 10), state="disabled")
+        self.hex_text.tag_configure('http-source', background='#ffe18c', foreground='#17352a')
         hex_y = ttk.Scrollbar(hex_tab, orient="vertical", command=self.hex_text.yview)
         hex_x = ttk.Scrollbar(hex_tab, orient="horizontal", command=self.hex_text.xview)
         self.hex_text.configure(yscrollcommand=hex_y.set, xscrollcommand=hex_x.set)
@@ -260,6 +272,7 @@ class SnifferApp:
         self.result = pending.result
         self.linktype = linktype
         self.filter_box.current(0)
+        self._reset_display_filter()
         self._reset_view()
         self.status_var.set(f'{self.source_label} · 链路类型 {linktype} · 正在读取')
 
@@ -384,11 +397,31 @@ class SnifferApp:
             counts += f' / 驱动报告丢弃 {result.kernel_dropped}'
         self.status_var.set(f'{state} · {self.source_label} · {counts}')
 
+    def apply_display_filter(self, _event=None):
+        try:
+            predicate = compile_display_filter(self.display_var.get())
+        except DisplayFilterError as error:
+            self.display_status.set(f'{error}；保留上一筛选')
+            return
+        self.display_predicate = predicate
+        self.display_status.set('已应用' if predicate is not None else '')
+        self._refresh_rows()
+
+    def _reset_display_filter(self):
+        self.display_var.set('')
+        self.display_status.set('')
+        self.display_predicate = None
+
+    def clear_display_filter(self):
+        self._reset_display_filter()
+        self._refresh_rows()
+
     def _matches(self, packet):
         if packet.number == self.pinned_frame:
             return True
         predicate = FILTERS[self.filter_var.get()]
         return ((predicate is None or predicate(packet)) and
+                (self.display_predicate is None or self.display_predicate(packet)) and
                 (self.stream is None or flow_identity(packet) == self.stream))
 
     def _append_packet(self, packet):
@@ -400,6 +433,7 @@ class SnifferApp:
             self.evicted += 1
             if number == self.pinned_frame:
                 self.pinned_frame = None
+                self.pinned_spans = ()
                 self.reference_var.set(f'来源帧 #{number} 已从缓存淘汰')
             iid = str(number)
             if self.packet_tree.exists(iid):
@@ -448,11 +482,17 @@ class SnifferApp:
             details = sorted(packet.detail, key=lambda item: not item[0].startswith(
                 ('HTTP/1.x start line', 'HTTP 首行来源帧')))
             for key, value in details:
-                if key.startswith('HTTP 首行来源帧') and len(packet.http_frames) > 1:
+                if key.startswith('HTTP 首行来源帧') and packet.http_spans:
                     group = self.detail_tree.insert('', 'end', text=key, values=(value,), open=True)
-                    for number in packet.http_frames:
+                    ranges_by_frame = {}
+                    for span in packet.http_spans:
+                        ranges_by_frame.setdefault(span.frame, []).append(
+                            f'0x{span.start:x}–0x{span.stop - 1:x}')
+                    for number, ranges in ranges_by_frame.items():
                         retained = number in self.packets
-                        detail = '点击查看原始字节' if retained else '已淘汰或未进入界面缓存'
+                        offsets = '、'.join(ranges)
+                        detail = (f'{offsets} · 点击高亮原始字节' if retained else
+                                  f'{offsets} · 已淘汰或未进入界面缓存')
                         tag = 'frame-link' if retained else 'frame-missing'
                         row = self.detail_tree.insert(group, 'end', text=f'帧 #{number}',
                                                       values=(detail,), tags=(tag,))
@@ -469,7 +509,26 @@ class SnifferApp:
                 ascii_part = ''.join(chr(byte) if 32 <= byte < 127 else '.' for byte in chunk)
                 lines.append(f'{offset:08x}  {hex_part:<47}  {ascii_part}')
             self.hex_text.insert('1.0', '\n'.join(lines))
+            if packet.number == self.pinned_frame:
+                self._highlight_source_bytes()
         self.hex_text.configure(state='disabled')
+
+    def _highlight_source_bytes(self):
+        for span in self.pinned_spans:
+            offset = span.start
+            while offset < span.stop:
+                row, column = divmod(offset, 16)
+                line = row + 1
+                count = min(span.stop - offset, 16 - column)
+                hex_start = 10 + 3 * column
+                ascii_start = 59 + column
+                self.hex_text.tag_add('http-source', f'{line}.{hex_start}',
+                                      f'{line}.{hex_start + 3 * count - 1}')
+                self.hex_text.tag_add('http-source', f'{line}.{ascii_start}',
+                                      f'{line}.{ascii_start + count}')
+                offset += count
+        if self.pinned_spans:
+            self.hex_text.see(f'{self.pinned_spans[0].start // 16 + 1}.0')
 
     def _select_frame(self, number):
         row = str(number)
@@ -494,19 +553,20 @@ class SnifferApp:
             return 'break'
         self.return_frame = origin.number
         self.pinned_frame = number
+        self.pinned_spans = tuple(span for span in origin.http_spans if span.frame == number)
         self._refresh_rows()
-        self._select_frame(number)
         self.detail_tabs.select(self.hex_tab)
-        packet = self.packets[number]
-        if packet.tcp is not None:
-            self.hex_text.see(f'{packet.tcp.payload_offset // 16 + 1}.0')
-        self.reference_var.set(f'来源帧 #{number} · 来自重组帧 #{origin.number}')
+        self._select_frame(number)
+        highlighted = sum(span.stop - span.start for span in self.pinned_spans)
+        self.reference_var.set(
+            f'来源帧 #{number} · 来自重组帧 #{origin.number} · 高亮 {highlighted} 字节')
         self.return_button.configure(state='normal')
         return 'break'
 
     def return_to_http(self):
         number = self.return_frame
         self.return_frame = self.pinned_frame = None
+        self.pinned_spans = ()
         self.return_button.configure(state='disabled')
         self.reference_var.set('')
         self._refresh_rows()
@@ -526,6 +586,7 @@ class SnifferApp:
         self.stream = None
         self.processes = {}
         self.pinned_frame = self.return_frame = None
+        self.pinned_spans = ()
         self.reference_var.set('')
         self.return_button.configure(state='disabled')
         for window in tuple(self.flow_windows):

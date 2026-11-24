@@ -15,6 +15,8 @@ DLT_IPV4 = 228
 DLT_IPV6 = 229
 DLT_LINUX_SLL = 113
 DLT_LINUX_SLL2 = 276
+
+
 @dataclass(frozen=True)
 class TcpSegment:
     source_port: int
@@ -23,6 +25,19 @@ class TcpSegment:
     flags: int
     payload_length: int
     payload_offset: int
+
+
+@dataclass(frozen=True)
+class UdpHeader:
+    source_port: int
+    destination_port: int
+
+
+@dataclass(frozen=True)
+class HttpSpan:
+    frame: int
+    start: int
+    stop: int
 
 
 @dataclass
@@ -38,9 +53,14 @@ class Packet:
     detail: List[Tuple[str, str]]
     raw: bytes
     tcp: Optional[TcpSegment] = None
-    http_frames: Tuple[int, ...] = ()
+    http_spans: Tuple[HttpSpan, ...] = ()
     connection_id: int = 0
     connection_has_syn: bool = False
+    udp: Optional[UdpHeader] = None
+
+    @property
+    def http_frames(self):
+        return tuple(dict.fromkeys(span.frame for span in self.http_spans))
 
 
 def _u16(data: bytes, pos: int) -> int:
@@ -73,7 +93,7 @@ def _parse_packet(raw: bytes, linktype: int, number: int, timestamp_us: int,
     protocol = "Other"
     info = "Unrecognized or truncated packet"
     offset = 0
-    tcp = None
+    transport_header = None
     ethertype: Optional[int] = None
 
     if linktype == DLT_EN10MB:
@@ -154,7 +174,7 @@ def _parse_packet(raw: bytes, linktype: int, number: int, timestamp_us: int,
             ip_end = offset + total_len
             if ip_end > len(raw):
                 detail.append(("Capture note", "IPv4 datagram partially captured"))
-            protocol, info, tcp = _parse_transport(raw[:ip_end], transport, proto_num, 4, detail)
+            protocol, info, transport_header = _parse_transport(raw[:ip_end], transport, proto_num, 4, detail)
     elif ethertype == 0x86DD:
         if len(raw) < offset + 40 or raw[offset] >> 4 != 6:
             return Packet(number, timestamp_us, len(raw), wire_length, src, dst,
@@ -209,7 +229,7 @@ def _parse_packet(raw: bytes, linktype: int, number: int, timestamp_us: int,
         elif next_header == 59 or payload_len == 0:
             protocol, info = "IPv6", "No decoded IPv6 payload"
         else:
-            protocol, info, tcp = _parse_transport(ip, pos, next_header, 6, detail)
+            protocol, info, transport_header = _parse_transport(ip, pos, next_header, 6, detail)
     elif ethertype == 0x0806:
         protocol, info = "ARP", "Address resolution"
         if (len(raw) >= offset + 28 and _u16(raw, offset) == 1
@@ -221,7 +241,10 @@ def _parse_packet(raw: bytes, linktype: int, number: int, timestamp_us: int,
     else:
         info = "Ethernet type not decoded" if ethertype is not None else "No supported network layer found"
 
-    return Packet(number, timestamp_us, len(raw), wire_length, src, dst, protocol, info, detail, raw, tcp)
+    tcp = transport_header if isinstance(transport_header, TcpSegment) else None
+    udp = transport_header if isinstance(transport_header, UdpHeader) else None
+    return Packet(number, timestamp_us, len(raw), wire_length, src, dst, protocol, info, detail, raw,
+                  tcp=tcp, udp=udp)
 
 
 def _parse_transport(raw, pos, proto_num, version, detail):
@@ -262,7 +285,7 @@ def _parse_transport(raw, pos, proto_num, version, detail):
             return "UDP", "Invalid UDP length", None
         detail.extend([("UDP", ""), ("  Source port", str(sport)), ("  Destination port", str(dport)),
                        ("  Length", f"{length} bytes"), ("  Checksum", f"0x{_u16(raw, pos + 6):04x}")])
-        return "UDP", f"{sport} → {dport}", None
+        return "UDP", f"{sport} → {dport}", UdpHeader(sport, dport)
     if len(raw) < pos + 4:
         return name, f"Truncated {name} header", None
     kind, code = raw[pos], raw[pos + 1]

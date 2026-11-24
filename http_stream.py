@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from array import array
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from itertools import groupby
 import re
+
+from packet import HttpSpan
 
 LIMIT = 512
 MAX_DIRECTIONS = 1024
@@ -35,11 +38,12 @@ class Direction:
     from_syn: bool
     data: bytearray | None = None
     owners: array | None = None
+    raw_origins: dict = field(default_factory=dict)
     continuous: int = 0
     finished: bool = False
     reported_offset: int = -1
 
-    def add(self, offset, payload, frame):
+    def add(self, offset, payload, frame, payload_offset):
         end = min(LIMIT, offset + len(payload))
         start = max(0, offset)
         if start >= end:
@@ -47,10 +51,14 @@ class Direction:
         if self.data is None:
             self.data = bytearray(LIMIT)
             self.owners = array('Q', [0]) * LIMIT
+        added = False
         for position in range(start, end):
             if not self.owners[position]:
                 self.data[position] = payload[position - offset]
                 self.owners[position] = frame
+                added = True
+        if added:
+            self.raw_origins[frame] = payload_offset - offset
         previous = self.continuous
         while self.continuous < LIMIT and self.owners[self.continuous]:
             self.continuous += 1
@@ -59,15 +67,27 @@ class Direction:
         line, separator, _ = self.data[:self.continuous].partition(b'\r\n')
         if separator:
             self.finished = True
-            frames = tuple(dict.fromkeys(self.owners[:len(line) + 2]))
+            spans = self.line_spans(len(line) + 2) if HTTP_START.fullmatch(line) else None
             self.data = self.owners = None
-            if HTTP_START.fullmatch(line):
+            self.raw_origins.clear()
+            if spans:
                 self.reported_offset = 0
-                return bytes(line), frames
+                return bytes(line), spans
         elif self.continuous == LIMIT or not plausible_prefix(bytes(line[:8])):
             self.finished = True
             self.data = self.owners = None
+            self.raw_origins.clear()
         return None
+
+    def line_spans(self, length):
+        spans = []
+        position = 0
+        for frame, run in groupby(self.owners[:length]):
+            count = sum(1 for _ in run)
+            start = self.raw_origins[frame] + position
+            spans.append(HttpSpan(frame, start, start + count))
+            position += count
+        return tuple(spans)
 
 
 class HttpInspector:
@@ -112,7 +132,7 @@ class HttpInspector:
 
         offset = sequence_offset(sequence, state.origin)
         if not state.finished and offset < LIMIT:
-            result = state.add(offset, payload, packet.number)
+            result = state.add(offset, payload, packet.number, start)
             if result:
                 self.mark(packet, *result)
             return
@@ -123,7 +143,7 @@ class HttpInspector:
         first, separator, _ = payload.partition(b'\r\n')
         if separator and HTTP_START.fullmatch(first):
             state.reported_offset = offset
-            self.mark(packet, first, (packet.number,))
+            self.mark(packet, first, (HttpSpan(packet.number, start, start + len(first) + 2),))
 
     def keep(self, key, sequence, from_syn):
         state = Direction(sequence, self.clock, from_syn)
@@ -134,12 +154,13 @@ class HttpInspector:
         return state
 
     @staticmethod
-    def mark(packet, line, frames):
+    def mark(packet, line, spans):
         text = line.decode('ascii')
         packet.protocol = 'HTTP'
-        packet.http_frames = frames
+        packet.http_spans = spans
+        frames = packet.http_frames
         packet.info += ' | ' + text[:100]
         packet.detail.append(('HTTP/1.x start line', text))
         if len(frames) > 1:
             packet.info += f' [跨 {len(frames)} 段]'
-            packet.detail.append(('HTTP 首行来源帧（序号顺序）', ', '.join(map(str, frames))))
+        packet.detail.append(('HTTP 首行来源帧（序号顺序）', ', '.join(map(str, frames))))
